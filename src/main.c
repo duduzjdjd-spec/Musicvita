@@ -4,7 +4,9 @@
 //  - ALBUMES: links de Internet Archive (archive.org/details/...). Titulo, artista, portada y pistas salen solos.
 //  - CANCIONES: links directos a MP3 (opcional "Titulo | Artista | link").
 // Menu: Albumes, Canciones, Artistas (agrupa todo por artista) y buscar en YouTube canciones o albumes (solo canales "Artista - Topic").
-// YouTube sin PC: busca por instancias publicas de Piped; el audio AAC lo pide directo a YouTube (cliente VISIONOS) con Piped de respaldo.
+// YouTube sin PC, como ViTube: busquedas y albumes directo a YouTube (cliente WEB); el audio con el cliente VISIONOS
+// + visitorData guardado (ux0:data/MusicVita/visitor.txt) y reintentos; si el M4A no abre, toca la lista HLS.
+// Piped (instancias publicas o piped.txt) queda solo de respaldo.
 // Reproductor por streaming (HTTP Range): MP3 con minimp3 (CC0, github.com/lieff/minimp3);
 // M4A/MP4/M4B y AAC con el decodificador AAC de hardware de la Vita (sceAudiodec).
 //
@@ -18,6 +20,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <malloc.h>
+#include <sys/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/sysmodule.h>
@@ -590,7 +593,7 @@ static void url_enc(const char *s, char *o, int cap, int keep_slash) {
 
 // ---- Pistas de un album ----
 typedef struct { char file[256]; char title[128]; char artist[96]; char url[4096]; char cover[160]; float len; long long size; int track, kind; } Track;
-enum { K_UNKNOWN = 0, K_MP3, K_ADTS, K_MP4, K_FMP4 };   // formato: MP3, AAC suelto (.aac), contenedor MP4 (.m4a .mp4 .m4b)
+enum { K_UNKNOWN = 0, K_MP3, K_ADTS, K_MP4, K_FMP4, K_HLS };   // formato: MP3, AAC suelto (.aac), contenedor MP4 (.m4a .mp4 .m4b), lista HLS (.m3u8, como ViTube)
 static Track *tracks; static int ntracks;
 static char alb_id[96], alb_title[160], alb_creator[96];   // lista que suena ahora (album o "Mis canciones")
 
@@ -1161,6 +1164,288 @@ static int s_xfer(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t 
   return ((int)(intptr_t)u != s_gen || !app_run) ? 1 : 0;
 }
 
+// =====================================================================
+//   HLS (lo que usa ViTube): YouTube da una lista .m3u8 y el audio viene en pedazos
+//   de unos segundos (.ts con AAC adentro, o fMP4). Cada pedazo se baja entero, se le
+//   saca el AAC y se mete al anillo como si fuera un .aac seguido.
+// =====================================================================
+typedef struct { char *url; double t; } HSeg;
+static struct { char url[4096]; HSeg *seg; int n, fmp4; double dur; } hl;   // la lista que suena (se cambia con plock tomado)
+
+static int hl_xfer(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
+  int gen = (int)(intptr_t)u;
+  if (!app_run) return 1;
+  if (gen >= 0) return gen != s_gen;
+  if (g_abort) return 1;
+  SceCtrlData p; sceCtrlPeekBufferPositive(0, &p, 1);         // desde el menu: O cancela
+  return (p.buttons & SCE_CTRL_CIRCLE) ? 1 : 0;
+}
+
+// Baja un archivo entero (lista o pedazo). gen >= 0: se corta si cambia la pista.
+static uint8_t *hl_fetch(const char *url, int gen, int *outlen, long *code) {
+  if (code) *code = 0;
+  CURL *c = curl_easy_init();
+  if (!c) return NULL;
+  struct mem m = {0, 0, 0};
+  curl_easy_setopt(c, CURLOPT_URL, url);
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wcb);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &m);
+  curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+  curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(c, CURLOPT_USERAGENT, YT_UA);
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 15L);
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+  curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, hl_xfer);
+  curl_easy_setopt(c, CURLOPT_XFERINFODATA, (void *)(intptr_t)gen);
+  CURLcode rc = curl_easy_perform(c);
+  long st = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st);
+  curl_easy_cleanup(c);
+  if (code) *code = st ? st : -(long)rc;
+  if (rc != CURLE_OK || st >= 400 || !m.b) { free(m.b); return NULL; }
+  if (outlen) *outlen = (int)m.n;
+  return (uint8_t *)m.b;
+}
+
+// Enlace relativo de la lista -> enlace completo
+static void hl_abs(const char *base, const char *ref, char *out, int cap) {
+  if (!strncmp(ref, "http://", 7) || !strncmp(ref, "https://", 8)) { snprintf(out, cap, "%s", ref); return; }
+  if (ref[0] == '/') {
+    const char *h = strstr(base, "://"); h = h ? strchr(h + 3, '/') : NULL;
+    int n = h ? (int)(h - base) : (int)strlen(base);
+    snprintf(out, cap, "%.*s%s", n, base, ref); return;
+  }
+  const char *q = strchr(base, '?');
+  int n = q ? (int)(q - base) : (int)strlen(base);
+  while (n > 0 && base[n - 1] != '/') n--;
+  snprintf(out, cap, "%.*s%s", n, base, ref);
+}
+
+// Valor de un atributo en una linea #EXT-X-...:A=B,C="D"
+static int hl_attr(const char *line, const char *key, char *out, int cap) {
+  out[0] = 0;
+  int kl = strlen(key);
+  for (const char *p = strchr(line, ':'); p && *p; ) {
+    p++;
+    if (!strncmp(p, key, kl) && p[kl] == '=') {
+      p += kl + 1;
+      int i = 0;
+      if (*p == '"') { p++; while (*p && *p != '"' && i < cap - 1) out[i++] = *p++; }
+      else while (*p && *p != ',' && i < cap - 1) out[i++] = *p++;
+      out[i] = 0;
+      return 1;
+    }
+    int inq = 0;                                          // salta hasta la siguiente coma fuera de comillas
+    while (*p && (inq || *p != ',')) { if (*p == '"') inq = !inq; p++; }
+    if (!*p) break;
+  }
+  return 0;
+}
+
+static void hl_free_segs(HSeg *s, int n) { for (int i = 0; i < n; i++) free(s[i].url); free(s); }
+
+// Abre una lista HLS (maestra o de medios). Elige solo el audio. 0 = lista, -1 = error (en err)
+static int hls_open(const char *url, char *err, int errcap) {
+  int n = 0; long code = 0;
+  char *d = (char *)hl_fetch(url, -1, &n, &code);
+  if (!d) { snprintf(err, errcap, "No se pudo leer la lista HLS (http %ld)", code); return -1; }
+  static char media[4096], tmp[4096], attr[160];
+  snprintf(media, sizeof media, "%s", url);
+  if (!strstr(d, "#EXTINF")) {                          // lista maestra: busca el audio
+    static char aud[4096], var[4096];
+    int ascore = -1; long vbw = 0x7FFFFFFF; int want_var = 0;
+    aud[0] = var[0] = 0;
+    char *save = NULL;
+    for (char *ln = strtok_r(d, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+      int l = strlen(ln); while (l > 0 && (ln[l - 1] == '\r' || ln[l - 1] == ' ')) ln[--l] = 0;
+      if (!strncmp(ln, "#EXT-X-MEDIA:", 13)) {
+        if (!hl_attr(ln, "TYPE", attr, sizeof attr) || strcmp(attr, "AUDIO")) continue;
+        if (!hl_attr(ln, "URI", tmp, sizeof tmp) || !tmp[0]) continue;
+        int sc = 1;
+        if (hl_attr(ln, "DEFAULT", attr, sizeof attr) && !strcmp(attr, "YES")) sc += 2;
+        if (hl_attr(ln, "GROUP-ID", attr, sizeof attr) && strstr(attr, "234")) sc += 4;   // 234 = AAC 128 kbps
+        if (hl_attr(ln, "NAME", attr, sizeof attr) && (strstr(attr, "original") || strstr(attr, "Original"))) sc += 1;
+        if (sc > ascore) { ascore = sc; hl_abs(url, tmp, aud, sizeof aud); }
+      } else if (!strncmp(ln, "#EXT-X-STREAM-INF:", 18)) {
+        long bw = hl_attr(ln, "BANDWIDTH", attr, sizeof attr) ? atol(attr) : 0x7FFFFFFE;
+        want_var = !(hl_attr(ln, "CODECS", attr, sizeof attr) && !strstr(attr, "mp4a")) && bw < vbw;
+        if (want_var) vbw = bw;
+      } else if (ln[0] && ln[0] != '#' && want_var) {
+        hl_abs(url, ln, var, sizeof var); want_var = 0;  // variante mas liviana (video + audio juntos)
+      }
+    }
+    free(d);
+    if (aud[0]) snprintf(media, sizeof media, "%s", aud);
+    else if (var[0]) snprintf(media, sizeof media, "%s", var);
+    else { snprintf(err, errcap, "La lista HLS no trae audio"); return -1; }
+    d = (char *)hl_fetch(media, -1, &n, &code);
+    if (!d) { snprintf(err, errcap, "No se pudo leer el audio HLS (http %ld)", code); return -1; }
+  }
+  int cap = 0, ns = 0; HSeg *seg = NULL;
+  double cur = 0, segdur = 0;
+  static char map[4096]; map[0] = 0;
+  char *save = NULL;
+  for (char *ln = strtok_r(d, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+    int l = strlen(ln); while (l > 0 && (ln[l - 1] == '\r' || ln[l - 1] == ' ')) ln[--l] = 0;
+    if (!strncmp(ln, "#EXTINF:", 8)) segdur = atof(ln + 8);
+    else if (!strncmp(ln, "#EXT-X-MAP:", 11)) { if (hl_attr(ln, "URI", tmp, sizeof tmp)) hl_abs(media, tmp, map, sizeof map); }
+    else if (ln[0] && ln[0] != '#') {
+      if (ns == cap) {
+        cap = cap ? cap * 2 : 128;
+        HSeg *nsg = realloc(seg, sizeof(HSeg) * cap);
+        if (!nsg) break;
+        seg = nsg;
+      }
+      hl_abs(media, ln, tmp, sizeof tmp);
+      seg[ns].url = strdup(tmp); seg[ns].t = cur;
+      if (!seg[ns].url) break;
+      ns++; cur += segdur; segdur = 0;
+    }
+  }
+  free(d);
+  if (!ns) { hl_free_segs(seg, ns); snprintf(err, errcap, "La lista HLS esta vacia"); return -1; }
+  M4 nx; memset(&nx, 0, sizeof nx);
+  if (map[0]) {                                          // fMP4: la cabecera (moov) dice como es el AAC
+    int mn = 0; uint8_t *mb = hl_fetch(map, -1, &mn, &code), *mo = NULL;
+    uint64_t ml = 0;
+    if (mb) mo = (uint8_t *)box(mb, mb + mn, "moov", &ml);
+    if (!mo || m4_parse(mo, ml, &nx) < 0 || nx.codec != 1) {
+      snprintf(err, errcap, "%s", nx.err[0] ? nx.err : "Cabecera HLS ilegible");
+      free(mb); m4_free(&nx); hl_free_segs(seg, ns); return -1;
+    }
+    free(mb);
+  }
+  plock();
+  HSeg *old = hl.seg; int oldn = hl.n;
+  snprintf(hl.url, sizeof hl.url, "%s", url);
+  hl.seg = seg; hl.n = ns; hl.dur = cur; hl.fmp4 = map[0] != 0;
+  M4 om; int swapped = 0;
+  if (hl.fmp4) { om = m4; m4 = nx; swapped = 1; }
+  s_gen++;                                               // lo que sonaba con la lista vieja se descarta
+  punlock();
+  hl_free_segs(old, oldn);
+  if (swapped) m4_free(&om);
+  return 0;
+}
+
+static int hls_seg_at(double t) {
+  int k = 0;
+  for (int i = 0; i < hl.n; i++) { if (hl.seg[i].t <= t + 0.01) k = i; else break; }
+  return k;
+}
+
+// Mete bytes al anillo (espera si esta lleno). -1 si la pista cambio.
+static int ring_push(int gen, const uint8_t *d, int len) {
+  while (len > 0) {
+    if (gen != s_gen || !app_run) return -1;
+    plock();
+    int n = 0;
+    if (gen == s_gen) {
+      int room = RING_SZ - r_cnt;
+      n = len < room ? len : room;
+      int first = RING_SZ - r_wr < n ? RING_SZ - r_wr : n;
+      memcpy(ring + r_wr, d, first);
+      if (n > first) memcpy(ring, d + first, n - first);
+      r_wr = (r_wr + n) % RING_SZ; r_cnt += n;
+    }
+    punlock();
+    d += n; len -= n;
+    if (!n) sceKernelDelayThread(10000);
+  }
+  return 0;
+}
+
+// MPEG-TS -> AAC (cuadros ADTS seguidos). Devuelve cuantos bytes dejo en out.
+static int ts_to_adts(const uint8_t *d, int len, uint8_t *out, int cap) {
+  int pmt = -1, apid = -1, n = 0, o = 0;
+  while (o + 188 <= len && !(d[o] == 0x47 && (o + 188 == len || d[o + 188] == 0x47))) o++;
+  for (; o + 188 <= len; o += 188) {
+    const uint8_t *p = d + o;
+    if (p[0] != 0x47) {                                   // se perdio la sincronia: busca el siguiente 0x47
+      int r = o + 1; while (r + 188 <= len && d[r] != 0x47) r++;
+      o = r - 188; continue;
+    }
+    int pusi = p[1] & 0x40, pid = ((p[1] & 0x1F) << 8) | p[2], afc = (p[3] >> 4) & 3, pl = 4;
+    if (afc & 2) pl += 1 + p[4];
+    if (!(afc & 1) || pl >= 188) continue;
+    const uint8_t *q = p + pl; int ql = 188 - pl;
+    if (pid == 0 || (pid == pmt && apid < 0)) {          // tablas PAT / PMT
+      if (!pusi) continue;
+      int ptr = q[0]; q += 1 + ptr; ql -= 1 + ptr;
+      if (ql < 12) continue;
+      int sl = ((q[1] & 0x0F) << 8) | q[2], end = 3 + sl - 4;
+      if (end > ql) end = ql;
+      if (pid == 0 && q[0] == 0x00 && pmt < 0) {
+        for (int i = 8; i + 4 <= end; i += 4)
+          if ((q[i] << 8 | q[i + 1]) != 0) { pmt = ((q[i + 2] & 0x1F) << 8) | q[i + 3]; break; }
+      } else if (pid == pmt && q[0] == 0x02) {
+        int pil = ((q[10] & 0x0F) << 8) | q[11];
+        for (int i = 12 + pil; i + 5 <= end; ) {
+          int st = q[i], epid = ((q[i + 1] & 0x1F) << 8) | q[i + 2], el = ((q[i + 3] & 0x0F) << 8) | q[i + 4];
+          if (st == 0x0F && apid < 0) apid = epid;        // 0x0F = AAC en ADTS
+          i += 5 + el;
+        }
+      }
+      continue;
+    }
+    if (apid < 0 && pusi && ql >= 4 && !q[0] && !q[1] && q[2] == 1 && q[3] >= 0xC0 && q[3] <= 0xDF) apid = pid;   // sin PMT: el primer audio
+    if (pid != apid) continue;
+    if (pusi) {                                           // cabecera PES: se tira
+      if (ql < 9 || q[0] || q[1] || q[2] != 1) continue;
+      int h = 9 + q[8];
+      if (h > ql) continue;
+      q += h; ql -= h;
+    }
+    if (n + ql > cap) break;
+    memcpy(out + n, q, ql); n += ql;
+  }
+  return n;
+}
+
+// Un pedazo bajado -> anillo. -1: cambio la pista, -2: formato que no se sabe leer
+static int hls_push(int gen, const uint8_t *b, int len, int fmp4) {
+  if (fmp4) return ring_push(gen, b, len);              // moof + mdat: el decodificador ya los entiende
+  if (len >= 188 && b[0] == 0x47) {
+    uint8_t *o = malloc(len);
+    if (!o) return -2;
+    int n = ts_to_adts(b, len, o, len);
+    int r = n > 0 ? ring_push(gen, o, n) : -2;
+    free(o);
+    return r;
+  }
+  int o = 0;                                             // audio empaquetado: etiqueta(s) ID3 + ADTS
+  while (o + 10 <= len && !memcmp(b + o, "ID3", 3))
+    o += 10 + (((b[o + 6] & 0x7F) << 21) | ((b[o + 7] & 0x7F) << 14) | ((b[o + 8] & 0x7F) << 7) | (b[o + 9] & 0x7F)) + ((b[o + 5] & 0x10) ? 10 : 0);
+  if (o + 1 < len && b[o] == 0xFF && (b[o + 1] & 0xF6) == 0xF0) return ring_push(gen, b + o, len - o);
+  return -2;
+}
+
+// Hilo de red para HLS: baja los pedazos desde el numero k, uno tras otro
+static void hls_stream(int gen, int k) {
+  static char url[4096];
+  for (;;) {
+    int ns, fm;
+    plock(); ns = hl.n; fm = hl.fmp4; if (k < ns) snprintf(url, sizeof url, "%s", hl.seg[k].url); punlock();
+    if (gen != s_gen || !app_run) return;
+    if (k >= ns) { s_eof_gen = gen; return; }
+    uint8_t *b = NULL; int len = 0; long code = 0;
+    for (int tries = 0; tries < 4 && !b; tries++) {
+      b = hl_fetch(url, gen, &len, &code);
+      if (b || gen != s_gen || !app_run || code == 403 || code == 404 || code == 410) break;
+      sceKernelDelayThread(1000000);
+    }
+    if (gen != s_gen || !app_run) { free(b); return; }
+    if (!b) { s_err = code >= 400 ? (int)code : -1; s_eof_gen = gen; return; }
+    int r = hls_push(gen, b, len, fm);
+    free(b);
+    if (r == -1) return;
+    if (r == -2) { s_err = -2; s_eof_gen = gen; return; }
+    k++;
+  }
+}
+
 static int stream_thread(SceSize a, void *u) {
   static char url[4096];
   int handled = -1;
@@ -1168,7 +1453,8 @@ static int stream_thread(SceSize a, void *u) {
     int gen = s_gen;
     if (gen == handled || !s_url[0]) { sceKernelDelayThread(10000); continue; }
     handled = gen;
-    plock(); snprintf(url, sizeof url, "%s", s_url); long long off = s_off; punlock();
+    plock(); snprintf(url, sizeof url, "%s", s_url); long long off = s_off; int skind = s_kind; punlock();
+    if (skind == K_HLS) { hls_stream(gen, (int)off); continue; }   // HLS: s_off es el numero de pedazo
     int tries = 0;
     int chunked = strstr(url, "googlevideo.com") != NULL;
     for (;;) {
@@ -1226,7 +1512,9 @@ static int dec_thread(SceSize a, void *u) {
     if (gen != my_gen) {
       my_gen = gen; ib_len = 0; mp3dec_init(&mp3d);
       kind = s_kind; si = s_m4si; pos = s_off;
-      id3_done = s_off != 0 || kind == K_MP4 || kind == K_FMP4;           // la etiqueta ID3 solo esta al inicio del archivo
+      int is_hls = kind == K_HLS;
+      if (is_hls) kind = hl.fmp4 ? K_FMP4 : K_ADTS;                    // HLS: llega AAC seguido o moof+mdat
+      id3_done = s_off != 0 || kind == K_MP4 || kind == K_FMP4 || is_hls;   // la etiqueta ID3 solo esta al inicio del archivo
       id3_skip = 0; fn = fi = 0; fnext = skip_left = 0;
     }
     if (!p_active || p_paused || p_end_gen == gen) { sceKernelDelayThread(10000); continue; }
@@ -1562,22 +1850,88 @@ static void yt_diag_add(const char *what, int rc, long st, const char *extra) {
   if (yt_ndiag < 24) snprintf(yt_diag[yt_ndiag++], sizeof yt_diag[0], "%s   curl %d  http %ld   %s", what, rc, st, extra);
 }
 
-// Pide el audio DIRECTAMENTE a YouTube desde tu WiFi (cliente VISIONOS: enlaces directos, sin token ni PC).
-static int yt_resolve_direct(Track *t) {
-  static char body[1400];
-  snprintf(body, sizeof body,
-    "{\"context\":{\"client\":{\"clientName\":\"VISIONOS\",\"clientVersion\":\"1.02\",\"deviceMake\":\"Apple\","
-    "\"deviceModel\":\"RealityDevice17,1\",\"userAgent\":\"" YT_UA "\",\"osName\":\"visionOS\",\"osVersion\":\"26.5.23O471\","
-    "\"hl\":\"en\",\"gl\":\"US\"}},\"videoId\":\"%.11s\",\"contentCheckOk\":true,\"racyCheckOk\":true}", t->file + 3);
+// =====================================================================
+//   YOUTUBE DIRECTO, como lo hace ViTube (sin Piped, sin PC):
+//   - un "visitorData" (identificador de visitante) que YouTube manda en cada respuesta;
+//     se guarda en ux0:data/MusicVita/visitor.txt y se manda siempre (X-Goog-Visitor-Id).
+//     Sin el, YouTube contesta "Sign in to confirm you're not a bot".
+//   - el reproductor se pide con el cliente VISIONOS + playbackContext, y se reintenta.
+//   - si el M4A directo no abre, se toca la lista HLS (hlsManifestUrl), igual que ViTube.
+//   - busquedas y albumes con el cliente WEB; Piped queda solo de respaldo.
+// =====================================================================
+static int yt_match(const char *artist, const char *query);
+#define YT_DIR "ux0:data/MusicVita"
+#define YT_WEB_VER "2.20260708.00.00"
+static char yt_visitor[200];
+static int yt_visitor_loaded;
+static char yt_hls_id[12], yt_hls_url[4096];        // lista HLS del ultimo video pedido (respaldo)
+
+static void yt_visitor_init(void) {
+  if (yt_visitor_loaded) return;
+  yt_visitor_loaded = 1;
+  FILE *f = fopen(YT_DIR "/visitor.txt", "r");
+  if (f) { if (!fgets(yt_visitor, sizeof yt_visitor, f)) yt_visitor[0] = 0; fclose(f); trim(yt_visitor); }
+}
+
+static void yt_visitor_set(const char *v, int n) {
+  if (n <= 0 || n >= (int)sizeof yt_visitor) { yt_visitor[0] = 0; remove(YT_DIR "/visitor.txt"); return; }
+  memcpy(yt_visitor, v, n); yt_visitor[n] = 0;
+  mkdir(YT_DIR, 0777);
+  FILE *f = fopen(YT_DIR "/visitor.txt", "w");
+  if (f) { fputs(yt_visitor, f); fclose(f); }
+}
+
+// Si aun no hay visitorData, toma el que viene en la respuesta
+static void yt_visitor_take(const char *resp) {
+  if (yt_visitor[0] || !resp) return;
+  const char *p = strstr(resp, "\"visitorData\"");
+  if (!p) return;
+  p = jws(p + 13);
+  if (!p || *p != ':') return;
+  p = jws(p + 1);
+  if (!p || *p != '"') return;
+  p++;
+  const char *e = strchr(p, '"');
+  if (e && e - p > 10) yt_visitor_set(p, (int)(e - p));
+}
+
+// Texto JSON seguro (comillas y barras)
+static void yt_jesc(const char *s, char *o, int cap) {
+  int i = 0;
+  for (; *s && i < cap - 3; s++) {
+    unsigned char ch = (unsigned char)*s;
+    if (ch == '"' || ch == '\\') { o[i++] = '\\'; o[i++] = ch; }
+    else if (ch >= 0x20) o[i++] = ch;
+  }
+  o[i] = 0;
+}
+
+// POST a la API interna de YouTube. web=0: cliente VISIONOS (audio), web=1: cliente WEB (busquedas, albumes)
+static char *yt_post(const char *ep, int web, const char *fields, long *st_out, int *rc_out) {
+  static char body[3000], url[160], vh[260];
+  char vis[240] = "";
+  yt_visitor_init();
+  if (yt_visitor[0]) snprintf(vis, sizeof vis, ",\"visitorData\":\"%s\"", yt_visitor);
+  if (web)
+    snprintf(body, sizeof body,
+      "{\"context\":{\"client\":{\"clientName\":\"WEB\",\"clientVersion\":\"" YT_WEB_VER "\",\"userAgent\":\"" YT_UA "\","
+      "\"hl\":\"en\",\"gl\":\"US\",\"timeZone\":\"UTC\",\"utcOffsetMinutes\":0%s}},%s}", vis, fields);
+  else
+    snprintf(body, sizeof body,
+      "{\"context\":{\"client\":{\"clientName\":\"VISIONOS\",\"clientVersion\":\"1.02\",\"deviceMake\":\"Apple\","
+      "\"deviceModel\":\"RealityDevice17,1\",\"userAgent\":\"" YT_UA "\",\"osName\":\"visionOS\",\"osVersion\":\"26.5.23O471\","
+      "\"hl\":\"en\",\"gl\":\"US\",\"timeZone\":\"UTC\",\"utcOffsetMinutes\":0%s}},%s}", vis, fields);
+  snprintf(url, sizeof url, "https://www.youtube.com/youtubei/v1/%s?prettyPrint=false", ep);
   CURL *c = curl_easy_init();
-  if (!c) return -1;
+  if (!c) return NULL;
   struct curl_slist *h = NULL;
   h = curl_slist_append(h, "Content-Type: application/json");
-  h = curl_slist_append(h, "X-YouTube-Client-Name: 101");
-  h = curl_slist_append(h, "X-YouTube-Client-Version: 1.02");
+  h = curl_slist_append(h, web ? "X-YouTube-Client-Name: 1" : "X-YouTube-Client-Name: 101");
+  h = curl_slist_append(h, web ? "X-YouTube-Client-Version: " YT_WEB_VER : "X-YouTube-Client-Version: 1.02");
   h = curl_slist_append(h, "Origin: https://www.youtube.com");
+  if (yt_visitor[0]) { snprintf(vh, sizeof vh, "X-Goog-Visitor-Id: %s", yt_visitor); h = curl_slist_append(h, vh); }
   struct mem m = {0, 0, 0};
-  curl_easy_setopt(c, CURLOPT_URL, "https://www.youtube.com/youtubei/v1/player?prettyPrint=false");
+  curl_easy_setopt(c, CURLOPT_URL, url);
   curl_easy_setopt(c, CURLOPT_POST, 1L);
   curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
   curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
@@ -1590,7 +1944,7 @@ static int yt_resolve_direct(Track *t) {
   curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
   curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 12L);
-  curl_easy_setopt(c, CURLOPT_TIMEOUT, 25L);
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
   curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
   curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, yt_xfer);
@@ -1598,21 +1952,34 @@ static int yt_resolve_direct(Track *t) {
   long st = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st);
   curl_easy_cleanup(c);
   curl_slist_free_all(h);
-  if (rc != CURLE_OK || st >= 400 || !m.b) {
-    yt_diag_add("YouTube directo", (int)rc, st, yt_why((int)rc, st));
-    free(m.b);
-    return -1;
-  }
-  static char best[4096], url[4096];
+  if (st_out) *st_out = st;
+  if (rc_out) *rc_out = (int)rc;
+  if (rc != CURLE_OK || st >= 400 || !m.b) { free(m.b); return NULL; }
+  yt_visitor_take(m.b);
+  return m.b;
+}
+
+// Una peticion al reproductor. 0 = hay audio (en t), 1 = YouTube dijo que no, -1 = error de red
+static int yt_player_once(Track *t, int att) {
+  static char fields[300];
+  snprintf(fields, sizeof fields,
+    "\"videoId\":\"%.11s\",\"contentCheckOk\":true,\"racyCheckOk\":true,"
+    "\"playbackContext\":{\"contentPlaybackContext\":{\"html5Preference\":\"HTML5_PREF_WANTS\"}}", t->file + 3);
+  long st = 0; int rc = 0;
+  char *r = yt_post("player", 0, fields, &st, &rc);
+  char what[40]; snprintf(what, sizeof what, "YouTube directo (%d)", att);
+  if (!r) { yt_diag_add(what, rc, st, yt_why(rc, st)); return -1; }
+  static char best[4096], url[4096], hls[4096];
   char mime[72], br[24], stt[40] = "", why[90] = "", extra[96];
-  best[0] = 0;
+  best[0] = hls[0] = 0;
   int bestbr = -1;
-  const char *v, *sd = jget(m.b, "streamingData");
-  const char *ps = jget(m.b, "playabilityStatus");
+  const char *v, *sd = jget(r, "streamingData");
+  const char *ps = jget(r, "playabilityStatus");
   if (ps) {
     if ((v = jget(ps, "status"))) jtext(v, stt, sizeof stt);
     if ((v = jget(ps, "reason"))) jtext(v, why, sizeof why);
   }
+  if (sd && (v = jget(sd, "hlsManifestUrl"))) jtext(v, hls, sizeof hls);
   const char *af = sd ? jget(sd, "adaptiveFormats") : NULL;
   for (const char *a = jarr_first(af); a; a = jarr_next(a)) {            // audio M4A (itag 140: AAC 128 kbps)
     mime[0] = br[0] = url[0] = 0;
@@ -1624,6 +1991,7 @@ static int yt_resolve_direct(Track *t) {
     if (b > bestbr) { bestbr = b; snprintf(best, sizeof best, "%s", url); }
   }
   int kind = K_FMP4;
+  if (!best[0] && hls[0]) { snprintf(best, sizeof best, "%s", hls); kind = K_HLS; }   // solo HLS: como ViTube
   if (!best[0]) {                                                         // sin audio suelto: MP4 normal (itag 18)
     const char *fm = sd ? jget(sd, "formats") : NULL;
     for (const char *a = jarr_first(fm); a; a = jarr_next(a)) {
@@ -1633,12 +2001,243 @@ static int yt_resolve_direct(Track *t) {
       if (!strncmp(mime, "video/mp4", 9) && url[0]) { snprintf(best, sizeof best, "%s", url); kind = K_MP4; break; }
     }
   }
-  free(m.b);
+  free(r);
+  snprintf(yt_hls_id, sizeof yt_hls_id, "%.11s", t->file + 3);
+  snprintf(yt_hls_url, sizeof yt_hls_url, "%s", hls);
   if (best[0]) { snprintf(t->url, sizeof t->url, "%s", best); t->kind = kind; return 0; }
   snprintf(extra, sizeof extra, "estado %s %s", stt[0] ? stt : "?", why);
-  yt_diag_add("YouTube directo", (int)rc, st, extra);
+  yt_diag_add(what, 0, st, extra);
+  return 1;
+}
+
+// Pide el audio DIRECTAMENTE a YouTube desde tu WiFi, con reintentos (ViTube hace hasta varios)
+static int yt_resolve_direct(Track *t) {
+  yt_visitor_init();
+  for (int att = 1; att <= 4; att++) {
+    char before[200]; snprintf(before, sizeof before, "%s", yt_visitor);
+    int r = yt_player_once(t, att);
+    if (r == 0) return 0;
+    if (yt_cancel || g_abort) return -1;
+    if (strcmp(before, yt_visitor)) continue;            // recien llego un visitorData: reintenta ya con el
+    if (r > 0 && att == 2 && yt_visitor[0]) { yt_visitor_set("", 0); continue; }   // este visitante quedo marcado: pide uno nuevo
+    sceKernelDelayThread(700000);
+  }
   return -1;
 }
+
+// ---- Busquedas y albumes con el cliente WEB ----
+// Texto de un campo de YouTube: "x", {"simpleText":"x"}, {"runs":[{"text":"x"},...]} o {"content":"x"}
+static void yt_txt(const char *v, char *dst, int cap) {
+  dst[0] = 0;
+  v = jws(v);
+  if (!v) return;
+  if (*v == '"') { jtext(v, dst, cap); return; }
+  if (*v != '{') return;
+  const char *x;
+  if ((x = jget(v, "simpleText")) || (x = jget(v, "content"))) { jtext(x, dst, cap); return; }
+  if ((x = jget(v, "runs"))) {
+    int n = 0;
+    for (const char *a = jarr_first(x); a && n < cap - 1; a = jarr_next(a)) {
+      char b[200];
+      const char *tt = jget(a, "text");
+      if (!tt) continue;
+      jtext(tt, b, sizeof b);
+      snprintf(dst + n, cap - n, "%s", b);
+      n = strlen(dst);
+    }
+  }
+}
+
+// Busca en la respuesta cada  "nombre":{...}  y llama fn con ese objeto
+static void yt_scan(const char *doc, const char *name, void (*fn)(const char *, void *), void *ctx) {
+  char pat[64]; snprintf(pat, sizeof pat, "\"%s\":", name);
+  int pl = strlen(pat);
+  for (const char *p = doc; p && (p = strstr(p, pat)); ) {
+    p += pl;
+    const char *o = jws(p);
+    if (o && *o == '{') fn(o, ctx);
+  }
+}
+
+typedef struct { char id[12]; char title[128]; char up[120]; int dsec; } YCand;
+typedef struct { YCand *c; int n, max; } YCands;
+
+static void yc_add(YCands *cs, const char *id, const char *title, const char *up, int dsec) {
+  if (cs->n >= cs->max || strlen(id) != 11 || !title[0]) return;
+  for (int k = 0; k < cs->n; k++) if (!strcmp(cs->c[k].id, id)) return;
+  YCand *c = &cs->c[cs->n++];
+  snprintf(c->id, sizeof c->id, "%s", id);
+  snprintf(c->title, sizeof c->title, "%s", title);
+  snprintf(c->up, sizeof c->up, "%s", up);
+  c->dsec = dsec;
+}
+
+// videoRenderer (busqueda), playlistVideoRenderer (album/lista), videoWithContextRenderer...
+static void yc_video(const char *o, void *u) {
+  char id[16] = "", title[128] = "", up[120] = "", dur[24] = "";
+  const char *v;
+  if ((v = jget(o, "videoId"))) jtext(v, id, sizeof id);
+  if (strlen(id) != 11) return;
+  yt_txt(jget(o, "title"), title, sizeof title);
+  if (!title[0]) yt_txt(jget(o, "headline"), title, sizeof title);
+  if ((v = jget(o, "lengthSeconds"))) jtext(v, dur, sizeof dur);
+  else yt_txt(jget(o, "lengthText"), dur, sizeof dur);
+  yt_txt(jget(o, "ownerText"), up, sizeof up);
+  if (!up[0]) yt_txt(jget(o, "shortBylineText"), up, sizeof up);
+  if (!up[0]) yt_txt(jget(o, "longBylineText"), up, sizeof up);
+  yc_add(u, id, title, up, (int)parse_len(dur));
+}
+
+// lockupViewModel: el formato nuevo de YouTube (videos)
+static void yc_lockup(const char *o, void *u) {
+  char ct[48] = "", id[16] = "", title[128] = "", up[120] = "", dur[24] = "";
+  const char *v;
+  if ((v = jget(o, "contentType"))) jtext(v, ct, sizeof ct);
+  if (!strstr(ct, "VIDEO")) return;
+  if ((v = jget(o, "contentId"))) jtext(v, id, sizeof id);
+  const char *meta = jget(jget(o, "metadata"), "lockupMetadataViewModel");
+  yt_txt(jget(meta, "title"), title, sizeof title);
+  const char *parts = jfind(meta, "metadataParts", '[', 0);
+  if (parts) yt_txt(jget(jarr_first(parts), "text"), up, sizeof up);
+  const char *badge = jfind(o, "thumbnailBadgeViewModel", '{', 0);
+  if (badge) yt_txt(jget(badge, "text"), dur, sizeof dur);
+  yc_add(u, id, title, up, (int)parse_len(dur));
+}
+
+static int yc_collect(const char *doc, YCand *c, int max) {
+  YCands cs = { c, 0, max };
+  yt_scan(doc, "videoRenderer", yc_video, &cs);
+  yt_scan(doc, "playlistVideoRenderer", yc_video, &cs);
+  yt_scan(doc, "videoWithContextRenderer", yc_video, &cs);
+  yt_scan(doc, "lockupViewModel", yc_lockup, &cs);
+  return cs.n;
+}
+
+// Candidatos -> pistas, con los mismos filtros que yt_collect (Topic, artista pedido primero)
+static int yc_tracks(const YCand *c, int nc, const char *query, Track *arr, int n, int max, int need_topic, int strict) {
+  for (int i = 0; i < nc && n < max; i++) {
+    char up[120]; snprintf(up, sizeof up, "%s", c[i].up);
+    if (c[i].dsec <= 0) continue;                              // directos y cosas sin duracion
+    int ul = (int)strlen(up), is_topic = ul > 8 && !strcmp(up + ul - 8, " - Topic");
+    if (need_topic && !is_topic) continue;
+    if (is_topic) up[ul - 8] = 0;
+    if (strict && !yt_match(up, query)) continue;
+    char key[20]; snprintf(key, sizeof key, "yt:%.11s", c[i].id);
+    int dup = 0;
+    for (int k = 0; k < n; k++) if (!strcmp(arr[k].file, key)) { dup = 1; break; }
+    if (dup) continue;
+    Track *t = &arr[n++];
+    memset(t, 0, sizeof *t);
+    snprintf(t->file, sizeof t->file, "%s", key);
+    snprintf(t->title, sizeof t->title, "%s", c[i].title);
+    snprintf(t->artist, sizeof t->artist, "%s", up);
+    snprintf(t->cover, sizeof t->cover, "https://i.ytimg.com/vi/%.11s/hqdefault.jpg", c[i].id);
+    t->len = (float)c[i].dsec;
+  }
+  return n;
+}
+
+// Busca canciones directo en YouTube. 0 si no salio nada (entonces se prueba Piped)
+static int yt_search_direct(const char *query, Track *arr, int max) {
+  YCand *c = calloc(80, sizeof(YCand));
+  if (!c) return 0;
+  int n = 0;
+  for (int pass = 0; pass < 2 && n == 0; pass++) {
+    char q2[160], qe[340], fields[460];
+    snprintf(q2, sizeof q2, pass == 0 ? "%s topic" : "%s", query);
+    yt_jesc(q2, qe, sizeof qe);
+    snprintf(fields, sizeof fields, "\"query\":\"%s\",\"params\":\"EgIQAQ%%3D%%3D\"", qe);   // solo videos
+    long st = 0; int rc = 0;
+    char *doc = yt_post("search", 1, fields, &st, &rc);
+    if (!doc) { yt_diag_add("YouTube busqueda", rc, st, yt_why(rc, st)); break; }
+    int nc = yc_collect(doc, c, 80);
+    free(doc);
+    n = yc_tracks(c, nc, query, arr, n, max, pass == 0, 1);     // primero los del artista pedido
+    n = yc_tracks(c, nc, query, arr, n, max, pass == 0, 0);     // despues el resto
+    if (yt_cancel) break;
+  }
+  free(c);
+  return n;
+}
+
+// Canciones de un album/lista (OLAK5uy_...) directo en YouTube
+static int yt_playlist_direct(const char *id, Track *arr, int max) {
+  YCand *c = calloc(200, sizeof(YCand));
+  if (!c) return 0;
+  char ide[120], fields[200];
+  yt_jesc(id, ide, sizeof ide);
+  snprintf(fields, sizeof fields, "\"browseId\":\"VL%s\"", ide);
+  long st = 0; int rc = 0;
+  char *doc = yt_post("browse", 1, fields, &st, &rc);
+  int n = 0;
+  if (doc) {
+    int nc = yc_collect(doc, c, 200);
+    n = yc_tracks(c, nc, "", arr, 0, max, 0, 0);
+    free(doc);
+    if (!n) yt_diag_add("YouTube album", 0, st, "la respuesta no trae canciones");
+  } else yt_diag_add("YouTube album", rc, st, yt_why(rc, st));
+  free(c);
+  return n;
+}
+
+// Albumes (listas OLAK5uy_ de los canales Topic) directo en YouTube
+typedef struct { EntryList *l; } YLctx;
+static void yl_add(EntryList *l, const char *id, const char *name, const char *upin, const char *th) {
+  if (strncmp(id, "OLAK5uy_", 8) || !name[0]) return;
+  for (int k = 0; k < l->n; k++) if (!strcmp(l->e[k].id, id)) return;
+  char up[120]; snprintf(up, sizeof up, "%s", upin);
+  int ul = (int)strlen(up);
+  if (ul > 8 && !strcmp(up + ul - 8, " - Topic")) up[ul - 8] = 0;
+  Entry *e = el_add(l);
+  if (!e) return;
+  snprintf(e->id, sizeof e->id, "%s", id);
+  if (up[0]) snprintf(e->name, sizeof e->name, "%s - %s", up, name); else snprintf(e->name, sizeof e->name, "%s", name);
+  if (strlen(th) < sizeof e->img) snprintf(e->img, sizeof e->img, "%s", th);
+}
+static void yl_renderer(const char *o, void *u) {              // playlistRenderer (formato viejo)
+  char id[96] = "", name[160] = "", up[120] = "", th[300] = "";
+  const char *v;
+  if ((v = jget(o, "playlistId"))) jtext(v, id, sizeof id);
+  yt_txt(jget(o, "title"), name, sizeof name);
+  yt_txt(jget(o, "shortBylineText"), up, sizeof up);
+  if (!up[0]) yt_txt(jget(o, "longBylineText"), up, sizeof up);
+  const char *tl = jfind(o, "thumbnails", '[', 0);
+  if (tl) { const char *uu = jget(jarr_first(tl), "url"); if (uu) jtext(uu, th, sizeof th); }
+  yl_add(((YLctx *)u)->l, id, name, up, th);
+}
+static void yl_lockup(const char *o, void *u) {                // lockupViewModel (formato nuevo)
+  char ct[48] = "", id[96] = "", name[160] = "", up[120] = "", th[300] = "";
+  const char *v;
+  if ((v = jget(o, "contentType"))) jtext(v, ct, sizeof ct);
+  if (!strstr(ct, "PLAYLIST") && !strstr(ct, "ALBUM")) return;
+  if ((v = jget(o, "contentId"))) jtext(v, id, sizeof id);
+  const char *meta = jget(jget(o, "metadata"), "lockupMetadataViewModel");
+  yt_txt(jget(meta, "title"), name, sizeof name);
+  const char *parts = jfind(meta, "metadataParts", '[', 0);
+  if (parts) yt_txt(jget(jarr_first(parts), "text"), up, sizeof up);
+  const char *src = jfind(o, "sources", '[', 0);
+  if (src) { const char *uu = jget(jarr_first(src), "url"); if (uu) jtext(uu, th, sizeof th); }
+  yl_add(((YLctx *)u)->l, id, name, up, th);
+}
+
+static int yt_album_search_direct(const char *query, EntryList *l) {
+  for (int pass = 0; pass < 2 && l->n == 0; pass++) {
+    char q2[160], qe[340], fields[460];
+    snprintf(q2, sizeof q2, pass == 0 ? "%s" : "%s album", query);
+    yt_jesc(q2, qe, sizeof qe);
+    snprintf(fields, sizeof fields, "\"query\":\"%s\",\"params\":\"EgIQAw%%3D%%3D\"", qe);   // solo listas
+    long st = 0; int rc = 0;
+    char *doc = yt_post("search", 1, fields, &st, &rc);
+    if (!doc) { yt_diag_add("YouTube albumes", rc, st, yt_why(rc, st)); break; }
+    YLctx cx = { l };
+    yt_scan(doc, "lockupViewModel", yl_lockup, &cx);
+    yt_scan(doc, "playlistRenderer", yl_renderer, &cx);
+    free(doc);
+    if (yt_cancel) break;
+  }
+  return l->n;
+}
+
 
 // Pista "yt:ID" -> enlace del audio por Piped (respaldo). Prefiere M4A (AAC); si no hay, un MP4 normal.
 static int yt_resolve_piped(Track *t) {
@@ -1737,7 +2336,8 @@ static int yt_collect(const char *doc, const char *key, const char *query, Track
 static int yt_search(const char *query, Track *arr, int max) {
   char q2[160], qe[400], path[600];
   int n = 0;
-  yt_ndiag = 0;
+  yt_ndiag = 0; yt_err[0] = 0; yt_cancel = 0;
+  if ((n = yt_search_direct(query, arr, max)) > 0 || yt_cancel) return n;   // directo (como ViTube); si no, Piped
   for (int pass = 0; pass < 2 && n == 0; pass++) {
     snprintf(q2, sizeof q2, pass == 0 ? "%s topic" : "%s", query);
     url_enc(q2, qe, sizeof qe, 0);
@@ -1791,6 +2391,23 @@ static void play_track_at(int i, double t) {
   }
   const char *url = tracks[i].url;
   int kind = track_kind(&tracks[i]);
+  if (kind == K_HLS) {                                 // lista HLS (como ViTube): salta al pedazo del tiempo pedido
+    if (strcmp(hl.url, url) || !hl.n) {
+      status("Leyendo la lista de audio (HLS)...");
+      char err[96] = "";
+      if (hls_open(url, err, sizeof err) < 0) {
+        snprintf(p_msg, sizeof p_msg, "%s", err);
+        tracks[i].url[0] = 0;                          // la proxima vez pide un enlace nuevo
+        p_start("", 0, 0, K_MP3, 0);
+        plock(); p_end_gen = s_gen; s_err = 1; punlock();
+        return;
+      }
+    }
+    if (hl.dur > 0) tracks[i].len = (float)hl.dur;
+    int k = hls_seg_at(t);
+    p_start(url, k, hl.seg[k].t, K_HLS, 0);
+    return;
+  }
   if (kind == K_FMP4) {                                // MP4 por fragmentos: salta al fragmento del tiempo pedido
     if (strcmp(m4.url, url) || (!m4.nfrag && !m4.n)) {
       status("Leyendo el audio...");
@@ -1798,6 +2415,14 @@ static void play_track_at(int i, double t) {
       int ok = fm_probe(url, &nx);
       plock(); M4 old = m4; m4 = nx; s_gen++; punlock();
       m4_free(&old);
+      if (ok < 0 && !strncmp(tracks[i].file, "yt:", 3) && yt_hls_url[0] &&
+          !strncmp(yt_hls_id, tracks[i].file + 3, 11)) {   // YouTube no dejo bajar el M4A: usa HLS como ViTube
+        snprintf(tracks[i].url, sizeof tracks[i].url, "%s", yt_hls_url);
+        tracks[i].kind = K_HLS;
+        yt_hls_url[0] = 0;
+        play_track_at(i, t);
+        return;
+      }
       if (ok < 0) {
         snprintf(p_msg, sizeof p_msg, "%s", m4.err[0] ? m4.err : "No se pudo abrir");
         p_start("", 0, 0, K_MP3, 0);
@@ -2180,7 +2805,8 @@ static void yt_diag_screen(const char *title) {
 // Albumes: las listas "OLAK5uy_..." son los albumes de los canales "Artista - Topic"
 static int yt_album_search(const char *query, EntryList *l) {
   char q2[160], qe[400], path[600];
-  yt_ndiag = 0;
+  yt_ndiag = 0; yt_err[0] = 0; yt_cancel = 0;
+  if (yt_album_search_direct(query, l) > 0 || yt_cancel) return l->n;      // directo (como ViTube); si no, Piped
   for (int pass = 0; pass < 2 && l->n == 0; pass++) {
     snprintf(q2, sizeof q2, pass == 0 ? "%s" : "%s album", query);
     url_enc(q2, qe, sizeof qe, 0);
@@ -2245,12 +2871,15 @@ static int yt_album_view(void) {
       if (r < 0) break;
       status("Cargando canciones del album...  (O = cancelar)");
       char path[160]; snprintf(path, sizeof path, "/playlists/%s", l.e[r].id);
-      yt_ndiag = 0;
-      char *doc = yt_api(path, "relatedStreams", 30, 10);
-      sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;
+      yt_ndiag = 0; yt_cancel = 0;
       Track *arr = calloc(128, sizeof(Track));
-      int nt = (doc && arr) ? yt_collect(doc, "relatedStreams", "", arr, 0, 120, 0, 0) : 0;
-      free(doc);
+      int nt = arr ? yt_playlist_direct(l.e[r].id, arr, 120) : 0;           // directo (como ViTube)
+      if (!nt && arr && !yt_cancel) {                                        // respaldo: Piped
+        char *doc = yt_api(path, "relatedStreams", 30, 10);
+        nt = doc ? yt_collect(doc, "relatedStreams", "", arr, 0, 120, 0, 0) : 0;
+        free(doc);
+      }
+      sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;
       if (!nt) {
         free(arr);
         if (!yt_cancel) {
