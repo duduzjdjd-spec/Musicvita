@@ -9,6 +9,8 @@
 //
 // Controles del reproductor: X/CUADRADO pausa, izquierda/derecha 10 s, arriba/abajo 1 min,
 // L/R pista anterior/siguiente, O volver.
+// Los textos largos (titulos, links) se recortan a proposito: no avisar de eso al compilar
+#pragma GCC diagnostic ignored "-Wformat-truncation"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
