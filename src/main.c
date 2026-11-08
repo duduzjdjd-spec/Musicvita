@@ -1418,6 +1418,8 @@ static char yt_inst[YT_MAXINST][96];
 static int yt_ninst, yt_cur, yt_refreshed;
 static char yt_err[96];
 static volatile int yt_cancel;
+static int yt_last_rc; static long yt_last_st;
+static char yt_diag[24][100]; static int yt_ndiag;       // que paso con cada instancia (se ve en pantalla si todas fallan)
 
 static void yt_add_inst(const char *u) {
   char b[160]; snprintf(b, sizeof b, "%s", u); trim(b);
@@ -1484,13 +1486,14 @@ static char *yt_get(const char *url, int connect_s, int total_s) {
   CURLcode rc = curl_easy_perform(c);
   long st = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st);
   curl_easy_cleanup(c);
+  yt_last_rc = (int)rc; yt_last_st = st;
   if (rc != CURLE_OK || st >= 400) { free(m.b); return NULL; }
   return m.b;
 }
 
 // Baja la lista oficial de instancias (la misma que usa el propio Piped)
 static void yt_refresh(void) {
-  char *d = yt_get("https://raw.githubusercontent.com/TeamPiped/documentation/refs/heads/main/content/docs/public-instances/index.md", 8, 20);
+  char *d = yt_get("https://raw.githubusercontent.com/TeamPiped/documentation/refs/heads/main/content/docs/public-instances/index.md", 12, 25);
   if (!d) return;
   char *save = NULL;
   for (char *ln = strtok_r(d, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
@@ -1503,10 +1506,23 @@ static void yt_refresh(void) {
   free(d);
 }
 
+static const char *yt_why(int rc, long st) {
+  if (rc == 0) return st >= 400 ? "el servidor responde con error" : "respuesta sin datos";
+  switch (rc) {
+    case 6: return "no encuentra el servidor (DNS)";
+    case 7: return "no se pudo conectar";
+    case 28: return "tardo demasiado";
+    case 35: case 51: case 58: case 60: case 77: case 83: return "fallo de conexion segura (TLS)";
+    case 52: case 56: return "conexion cortada";
+    case 42: return "cancelado";
+    default: return "error de red";
+  }
+}
+
 // Pide "path" a las instancias, una por una, hasta que una responda con "need" dentro
 static char *yt_api(const char *path, const char *need, int total_s, int maxatt) {
   char tried[YT_MAXINST]; memset(tried, 0, sizeof tried);
-  yt_err[0] = 0; yt_cancel = 0;
+  yt_err[0] = 0; yt_cancel = 0; yt_ndiag = 0;
   for (int att = 0; att < maxatt; att++) {
     int pick = -1;
     for (int k = 0; k < yt_ninst; k++) { int i = (yt_cur + k) % yt_ninst; if (!tried[i]) { pick = i; break; } }
@@ -1517,8 +1533,12 @@ static char *yt_api(const char *path, const char *need, int total_s, int maxatt)
     tried[pick] = 1;
     char url[1000];
     snprintf(url, sizeof url, "%s%s", yt_inst[pick], path);
-    char *d = yt_get(url, 5, total_s);
+    char *d = yt_get(url, 12, total_s);
     if (d && strstr(d, need)) { yt_cur = pick; return d; }
+    if (yt_ndiag < 24) {
+      const char *h = strstr(yt_inst[pick], "//"); h = h ? h + 2 : yt_inst[pick];
+      snprintf(yt_diag[yt_ndiag++], sizeof yt_diag[0], "%.36s   curl %d  http %ld   %s", h, yt_last_rc, yt_last_st, yt_why(yt_last_rc, yt_last_st));
+    }
     free(d);
     if (yt_cancel || g_abort) { snprintf(yt_err, sizeof yt_err, "Cancelado"); return NULL; }
   }
@@ -1529,7 +1549,7 @@ static char *yt_api(const char *path, const char *need, int total_s, int maxatt)
 // Pista "yt:ID" -> enlace del audio. Prefiere M4A (AAC); si no hay, un MP4 normal (el audio se saca de ahi).
 static int yt_resolve(Track *t) {
   char path[64]; snprintf(path, sizeof path, "/streams/%s", t->file + 3);
-  char *doc = yt_api(path, "audioStreams", 20, 6);
+  char *doc = yt_api(path, "audioStreams", 30, 14);
   if (!doc) return -1;
   static char best[2200], vbest[2200];
   best[0] = vbest[0] = 0;
@@ -1619,8 +1639,8 @@ static int yt_search(const char *query, Track *arr, int max) {
     snprintf(q2, sizeof q2, pass == 0 ? "%s topic" : "%s", query);
     url_enc(q2, qe, sizeof qe, 0);
     snprintf(path, sizeof path, "/search?q=%s&filter=%s", qe, pass == 0 ? "videos" : "music_songs");
-    char *doc = yt_api(path, "\"items\"", 20, 8);
-    if (!doc) { if (yt_cancel) break; continue; }
+    char *doc = yt_api(path, "\"items\"", 30, 14);
+    if (!doc) break;                                          // ninguna instancia respondio: no repetir con otro filtro
     n = yt_collect(doc, query, arr, n, max, pass == 0, 1);    // primero los del artista pedido
     n = yt_collect(doc, query, arr, n, max, pass == 0, 0);    // despues el resto
     free(doc);
@@ -2038,6 +2058,20 @@ static void msg_wait(const char *m) {
   }
 }
 
+static void yt_diag_screen(const char *title) {
+  for (;;) {
+    sceCtrlPeekBufferPositive(0, &pad, 1);
+    unsigned p = pad.buttons & ~oldpad.buttons; oldpad = pad;
+    if (p & (SCE_CTRL_CIRCLE | SCE_CTRL_CROSS)) break;
+    vita2d_start_drawing(); vita2d_clear_screen();
+    vita2d_pgf_draw_text(pgf, 30, 40, RGBA8(255,200,120,255), 1.1f, title);
+    for (int i = 0; i < yt_ndiag && i < 20; i++)
+      vita2d_pgf_draw_text(pgf, 30, 78 + i * 21, RGBA8(220,220,220,255), 0.8f, yt_diag[i]);
+    vita2d_pgf_draw_text(pgf, 30, 530, RGBA8(160,160,190,255), 0.85f, "O = volver");
+    vita2d_end_drawing(); vita2d_swap_buffers();
+  }
+}
+
 // Devuelve 0 o LS_EXIT
 static int yt_view(void) {
   static char query[128];
@@ -2052,7 +2086,10 @@ static int yt_view(void) {
     sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;
     if (!n) {
       free(arr);
-      if (!yt_cancel) msg_wait(yt_err[0] ? yt_err : "Sin resultados en canales Topic");
+      if (!yt_cancel) {
+        if (yt_err[0] && yt_ndiag) yt_diag_screen("Ninguna instancia respondio (esto dice por que):");
+        else msg_wait(yt_err[0] ? yt_err : "Sin resultados en canales Topic");
+      }
       continue;
     }
     char title[160];
