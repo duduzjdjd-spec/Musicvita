@@ -6,31 +6,12 @@
 // Despues de editar: "Commit changes", espera el check verde en Actions e instala el nuevo VPK.
 
 // ---------------------------------------------------------------------
-// YOUTUBE (menu "Buscar en YouTube (Topic)"): no necesita PC.
-// Usa instancias publicas de Piped (un servicio abierto que busca en YouTube y da el audio).
-// La app prueba una por una hasta que una responde, y si todas fallan baja sola la lista oficial
-// de https://github.com/TeamPiped/documentation (public-instances).
-// Si una instancia deja de funcionar, agrega otra aqui (o una por linea en
-// ux0:data/MusicVita/piped.txt en la Vita, sin recompilar). Formato: "https://pipedapi.ejemplo.com"
+// YOUTUBE (menu "Buscar en YouTube (Topic)"): no necesita PC. OPCIONAL, puedes dejarlo como esta.
+// Usa instancias publicas de Piped; la app ya trae una lista y prueba una por una.
+// Si alguna deja de funcionar y quieres agregar otra, quita las // de abajo y pon la tuya (con coma al final):
+//   #define PIPED_EXTRA "https://pipedapi.ejemplo.com",
+// Tambien puedes crear en la Vita ux0:data/MusicVita/piped.txt con una URL por linea (sin recompilar).
 // ---------------------------------------------------------------------
-static const char *PIPED[] = {
-  "https://pipedapi.kavin.rocks",
-  "https://pipedapi.leptons.xyz",
-  "https://pipedapi.nosebs.ru",
-  "https://pipedapi-libre.kavin.rocks",
-  "https://piped-api.privacy.com.de",
-  "https://pipedapi.adminforge.de",
-  "https://api.piped.yt",
-  "https://pipedapi.drgns.space",
-  "https://pipedapi.owo.si",
-  "https://pipedapi.ducks.party",
-  "https://piped-api.codespace.cz",
-  "https://pipedapi.reallyaweso.me",
-  "https://api.piped.private.coffee",
-  "https://pipedapi.darkness.services",
-  "https://pipedapi.orangenet.cc",
-  "",
-};
 
 // ---------------------------------------------------------------------
 // ALBUMES de Internet Archive: el link de la pagina del album.
