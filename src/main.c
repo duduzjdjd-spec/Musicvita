@@ -3,8 +3,8 @@
 // La app solo muestra lo que pongas en src/biblioteca.h:
 //  - ALBUMES: links de Internet Archive (archive.org/details/...). Titulo, artista, portada y pistas salen solos.
 //  - CANCIONES: links directos a MP3 (opcional "Titulo | Artista | link").
-// Menu: Albumes, Canciones, Artistas (agrupa todo por artista) y Buscar en YouTube (solo canales "Artista - Topic").
-// YouTube sin PC: busca y obtiene el audio AAC por instancias publicas de Piped; se toca con el decodificador AAC de la Vita.
+// Menu: Albumes, Canciones, Artistas (agrupa todo por artista) y buscar en YouTube canciones o albumes (solo canales "Artista - Topic").
+// YouTube sin PC: busca por instancias publicas de Piped; el audio AAC lo pide directo a YouTube (cliente VISIONOS) con Piped de respaldo.
 // Reproductor por streaming (HTTP Range): MP3 con minimp3 (CC0, github.com/lieff/minimp3);
 // M4A/MP4/M4B y AAC con el decodificador AAC de hardware de la Vita (sceAudiodec).
 //
@@ -44,6 +44,10 @@
 #define IA_IMG    "https://archive.org/services/img/%s"
 #define IA_DL     "https://archive.org/download/%s/%s"
 
+
+// YouTube directo: cliente VISIONOS (enlaces de audio directos, sin token). googlevideo pide el mismo user-agent.
+#define YT_UA "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+#define YT_CHUNK (1024 * 1024)      // googlevideo a veces rechaza pedidos sin limite: se baja en trozos de 1 MB
 
 int _newlib_heap_size_user = 48 * 1024 * 1024;
 
@@ -585,7 +589,7 @@ static void url_enc(const char *s, char *o, int cap, int keep_slash) {
 
 
 // ---- Pistas de un album ----
-typedef struct { char file[256]; char title[128]; char artist[96]; char url[2200]; char cover[160]; float len; long long size; int track, kind; } Track;
+typedef struct { char file[256]; char title[128]; char artist[96]; char url[4096]; char cover[160]; float len; long long size; int track, kind; } Track;
 enum { K_UNKNOWN = 0, K_MP3, K_ADTS, K_MP4, K_FMP4 };   // formato: MP3, AAC suelto (.aac), contenedor MP4 (.m4a .mp4 .m4b)
 static Track *tracks; static int ntracks;
 static char alb_id[96], alb_title[160], alb_creator[96];   // lista que suena ahora (album o "Mis canciones")
@@ -697,7 +701,7 @@ static uint8_t *http_range(const char *url, long long off, long long len, int *o
   curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
   curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
   curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(c, CURLOPT_USERAGENT, "MusicVita/1.0 (PS Vita homebrew)");
+  curl_easy_setopt(c, CURLOPT_USERAGENT, strstr(url, "googlevideo.com") ? YT_UA : "MusicVita/1.0 (PS Vita homebrew)");
   curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
   curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
   curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
@@ -720,7 +724,7 @@ static uint8_t *http_range(const char *url, long long off, long long len, int *o
 
 // ---- Indice de un archivo MP4/M4A: donde esta cada cuadro de audio ----
 typedef struct {
-  char url[2200];
+  char url[4096];
   int n;                       // cuadros
   long long *off; uint32_t *size;
   uint32_t *stts_cnt, *stts_dlt; int nstts;
@@ -1109,7 +1113,7 @@ static volatile int app_run = 1;
 static volatile int s_gen, s_eof_gen = -1, s_err;
 static volatile long long s_total;          // tamano del archivo (lo dice el servidor)
 static volatile int s_kind = K_MP3, s_m4si;  // formato de lo que suena y cuadro MP4 de inicio
-static char s_url[2200];
+static char s_url[4096];
 static long long s_off;
 static volatile int p_active, p_paused, p_end_gen = -1;
 static volatile double p_base;
@@ -1158,7 +1162,7 @@ static int s_xfer(void *u, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t 
 }
 
 static int stream_thread(SceSize a, void *u) {
-  static char url[2200];
+  static char url[4096];
   int handled = -1;
   while (app_run) {
     int gen = s_gen;
@@ -1166,6 +1170,7 @@ static int stream_thread(SceSize a, void *u) {
     handled = gen;
     plock(); snprintf(url, sizeof url, "%s", s_url); long long off = s_off; punlock();
     int tries = 0;
+    int chunked = strstr(url, "googlevideo.com") != NULL;
     for (;;) {
       CURL *c = curl_easy_init();
       if (!c) { s_err = -1; s_eof_gen = gen; break; }
@@ -1178,7 +1183,7 @@ static int stream_thread(SceSize a, void *u) {
       curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
       curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
       curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
-      curl_easy_setopt(c, CURLOPT_USERAGENT, "MusicVita/1.0 (PS Vita homebrew)");
+      curl_easy_setopt(c, CURLOPT_USERAGENT, strstr(url, "googlevideo.com") ? YT_UA : "MusicVita/1.0 (PS Vita homebrew)");
       curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 20L);
       curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);     // sin tiempo total: una cancion larga tarda
       curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
@@ -1186,12 +1191,17 @@ static int stream_thread(SceSize a, void *u) {
       curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
       curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, s_xfer);
       curl_easy_setopt(c, CURLOPT_XFERINFODATA, (void *)(intptr_t)gen);
-      if (off > 0) { snprintf(range, sizeof range, "%lld-", off); curl_easy_setopt(c, CURLOPT_RANGE, range); }
+      if (chunked) { snprintf(range, sizeof range, "%lld-%lld", off, off + YT_CHUNK - 1); curl_easy_setopt(c, CURLOPT_RANGE, range); }
+      else if (off > 0) { snprintf(range, sizeof range, "%lld-", off); curl_easy_setopt(c, CURLOPT_RANGE, range); }
       CURLcode rc = curl_easy_perform(c);
       long code = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
       curl_easy_cleanup(c);
       if (gen != s_gen || !app_run) break;
-      if (rc == CURLE_OK && code < 400) { s_eof_gen = gen; break; }       // termino de bajar
+      if (rc == CURLE_OK && code < 400) {
+        if (chunked && x.pos - off >= YT_CHUNK) { off = x.pos; tries = 0; continue; }   // faltan trozos
+        s_eof_gen = gen; break;                                                        // termino de bajar
+      }
+      if (chunked && code == 416) { s_eof_gen = gen; break; }                         // ya no hay mas
       if (x.pos > off) { off = x.pos; tries = 0; }                       // se corto: sigue donde quedo
       if (code >= 400 || ++tries > 5) { s_err = code >= 400 ? (int)code : -(int)rc; s_eof_gen = gen; break; }
       sceKernelDelayThread(1000000);
@@ -1522,7 +1532,7 @@ static const char *yt_why(int rc, long st) {
 // Pide "path" a las instancias, una por una, hasta que una responda con "need" dentro
 static char *yt_api(const char *path, const char *need, int total_s, int maxatt) {
   char tried[YT_MAXINST]; memset(tried, 0, sizeof tried);
-  yt_err[0] = 0; yt_cancel = 0; yt_ndiag = 0;
+  yt_err[0] = 0; yt_cancel = 0;
   for (int att = 0; att < maxatt; att++) {
     int pick = -1;
     for (int k = 0; k < yt_ninst; k++) { int i = (yt_cur + k) % yt_ninst; if (!tried[i]) { pick = i; break; } }
@@ -1546,18 +1556,102 @@ static char *yt_api(const char *path, const char *need, int total_s, int maxatt)
   return NULL;
 }
 
-// Pista "yt:ID" -> enlace del audio. Prefiere M4A (AAC); si no hay, un MP4 normal (el audio se saca de ahi).
-static int yt_resolve(Track *t) {
+static void yt_diag_screen(const char *title);
+
+static void yt_diag_add(const char *what, int rc, long st, const char *extra) {
+  if (yt_ndiag < 24) snprintf(yt_diag[yt_ndiag++], sizeof yt_diag[0], "%s   curl %d  http %ld   %s", what, rc, st, extra);
+}
+
+// Pide el audio DIRECTAMENTE a YouTube desde tu WiFi (cliente VISIONOS: enlaces directos, sin token ni PC).
+static int yt_resolve_direct(Track *t) {
+  static char body[1400];
+  snprintf(body, sizeof body,
+    "{\"context\":{\"client\":{\"clientName\":\"VISIONOS\",\"clientVersion\":\"1.02\",\"deviceMake\":\"Apple\","
+    "\"deviceModel\":\"RealityDevice17,1\",\"userAgent\":\"" YT_UA "\",\"osName\":\"visionOS\",\"osVersion\":\"26.5.23O471\","
+    "\"hl\":\"en\",\"gl\":\"US\"}},\"videoId\":\"%.11s\",\"contentCheckOk\":true,\"racyCheckOk\":true}", t->file + 3);
+  CURL *c = curl_easy_init();
+  if (!c) return -1;
+  struct curl_slist *h = NULL;
+  h = curl_slist_append(h, "Content-Type: application/json");
+  h = curl_slist_append(h, "X-YouTube-Client-Name: 101");
+  h = curl_slist_append(h, "X-YouTube-Client-Version: 1.02");
+  h = curl_slist_append(h, "Origin: https://www.youtube.com");
+  struct mem m = {0, 0, 0};
+  curl_easy_setopt(c, CURLOPT_URL, "https://www.youtube.com/youtubei/v1/player?prettyPrint=false");
+  curl_easy_setopt(c, CURLOPT_POST, 1L);
+  curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+  curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+  curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+  curl_easy_setopt(c, CURLOPT_USERAGENT, YT_UA);
+  curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, wcb);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA, &m);
+  curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
+  curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
+  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 12L);
+  curl_easy_setopt(c, CURLOPT_TIMEOUT, 25L);
+  curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, yt_xfer);
+  CURLcode rc = curl_easy_perform(c);
+  long st = 0; curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &st);
+  curl_easy_cleanup(c);
+  curl_slist_free_all(h);
+  if (rc != CURLE_OK || st >= 400 || !m.b) {
+    yt_diag_add("YouTube directo", (int)rc, st, yt_why((int)rc, st));
+    free(m.b);
+    return -1;
+  }
+  static char best[4096], url[4096];
+  char mime[72], br[24], stt[40] = "", why[90] = "", extra[96];
+  best[0] = 0;
+  int bestbr = -1;
+  const char *v, *sd = jget(m.b, "streamingData");
+  const char *ps = jget(m.b, "playabilityStatus");
+  if (ps) {
+    if ((v = jget(ps, "status"))) jtext(v, stt, sizeof stt);
+    if ((v = jget(ps, "reason"))) jtext(v, why, sizeof why);
+  }
+  const char *af = sd ? jget(sd, "adaptiveFormats") : NULL;
+  for (const char *a = jarr_first(af); a; a = jarr_next(a)) {            // audio M4A (itag 140: AAC 128 kbps)
+    mime[0] = br[0] = url[0] = 0;
+    if ((v = jget(a, "mimeType"))) jtext(v, mime, sizeof mime);
+    if ((v = jget(a, "url"))) jtext(v, url, sizeof url);
+    if ((v = jget(a, "bitrate"))) jtext(v, br, sizeof br);
+    if (strncmp(mime, "audio/mp4", 9) || !url[0]) continue;
+    int b = atoi(br);
+    if (b > bestbr) { bestbr = b; snprintf(best, sizeof best, "%s", url); }
+  }
+  int kind = K_FMP4;
+  if (!best[0]) {                                                         // sin audio suelto: MP4 normal (itag 18)
+    const char *fm = sd ? jget(sd, "formats") : NULL;
+    for (const char *a = jarr_first(fm); a; a = jarr_next(a)) {
+      mime[0] = url[0] = 0;
+      if ((v = jget(a, "mimeType"))) jtext(v, mime, sizeof mime);
+      if ((v = jget(a, "url"))) jtext(v, url, sizeof url);
+      if (!strncmp(mime, "video/mp4", 9) && url[0]) { snprintf(best, sizeof best, "%s", url); kind = K_MP4; break; }
+    }
+  }
+  free(m.b);
+  if (best[0]) { snprintf(t->url, sizeof t->url, "%s", best); t->kind = kind; return 0; }
+  snprintf(extra, sizeof extra, "estado %s %s", stt[0] ? stt : "?", why);
+  yt_diag_add("YouTube directo", (int)rc, st, extra);
+  return -1;
+}
+
+// Pista "yt:ID" -> enlace del audio por Piped (respaldo). Prefiere M4A (AAC); si no hay, un MP4 normal.
+static int yt_resolve_piped(Track *t) {
   char path[64]; snprintf(path, sizeof path, "/streams/%s", t->file + 3);
-  char *doc = yt_api(path, "audioStreams", 30, 14);
+  char *doc = yt_api(path, "audioStreams", 25, 4);
   if (!doc) return -1;
-  static char best[2200], vbest[2200];
+  static char best[4096], vbest[4096];
   best[0] = vbest[0] = 0;
   int bestbr = -1, vbr = 1 << 30;
   const char *v;
   for (const char *a = jarr_first(jget(doc, "audioStreams")); a; a = jarr_next(a)) {
     char mime[48] = "", br[24] = "";
-    static char url[2200];
+    static char url[4096];
     url[0] = 0;
     if ((v = jget(a, "mimeType"))) jtext(v, mime, sizeof mime);
     if ((v = jget(a, "url"))) jtext(v, url, sizeof url);
@@ -1569,7 +1663,7 @@ static int yt_resolve(Track *t) {
   if (!best[0]) {
     for (const char *a = jarr_first(jget(doc, "videoStreams")); a; a = jarr_next(a)) {
       char mime[48] = "", br[24] = "", vo[12] = "";
-      static char url[2200];
+      static char url[4096];
       url[0] = 0;
       if ((v = jget(a, "mimeType"))) jtext(v, mime, sizeof mime);
       if ((v = jget(a, "url"))) jtext(v, url, sizeof url);
@@ -1587,6 +1681,14 @@ static int yt_resolve(Track *t) {
   return -1;
 }
 
+// Directo desde YouTube; si no se puede, por una instancia de Piped
+static int yt_resolve(Track *t) {
+  yt_ndiag = 0; yt_err[0] = 0; yt_cancel = 0;
+  if (yt_resolve_direct(t) == 0) return 0;
+  if (yt_cancel) { snprintf(yt_err, sizeof yt_err, "Cancelado"); return -1; }
+  return yt_resolve_piped(t);
+}
+
 // Todas las palabras buscadas estan en el nombre del artista
 static int yt_match(const char *artist, const char *query) {
   char fa[200], fq[160];
@@ -1599,8 +1701,8 @@ static int yt_match(const char *artist, const char *query) {
 
 // Agrega a "arr" los resultados de una respuesta de /search. need_topic: solo canales "- Topic".
 // strict: solo los del artista buscado (para ponerlos primero).
-static int yt_collect(const char *doc, const char *query, Track *arr, int n, int max, int need_topic, int strict) {
-  for (const char *it = jarr_first(jget(doc, "items")); it && n < max; it = jarr_next(it)) {
+static int yt_collect(const char *doc, const char *key, const char *query, Track *arr, int n, int max, int need_topic, int strict) {
+  for (const char *it = jarr_first(jget(doc, key)); it && n < max; it = jarr_next(it)) {
     char url[96] = "", up[120] = "", title[128] = "", dur[16] = "";
     const char *v;
     if ((v = jget(it, "url"))) jtext(v, url, sizeof url);
@@ -1635,14 +1737,15 @@ static int yt_collect(const char *doc, const char *query, Track *arr, int n, int
 static int yt_search(const char *query, Track *arr, int max) {
   char q2[160], qe[400], path[600];
   int n = 0;
+  yt_ndiag = 0;
   for (int pass = 0; pass < 2 && n == 0; pass++) {
     snprintf(q2, sizeof q2, pass == 0 ? "%s topic" : "%s", query);
     url_enc(q2, qe, sizeof qe, 0);
     snprintf(path, sizeof path, "/search?q=%s&filter=%s", qe, pass == 0 ? "videos" : "music_songs");
     char *doc = yt_api(path, "\"items\"", 30, 14);
     if (!doc) break;                                          // ninguna instancia respondio: no repetir con otro filtro
-    n = yt_collect(doc, query, arr, n, max, pass == 0, 1);    // primero los del artista pedido
-    n = yt_collect(doc, query, arr, n, max, pass == 0, 0);    // despues el resto
+    n = yt_collect(doc, "items", query, arr, n, max, pass == 0, 1);    // primero los del artista pedido
+    n = yt_collect(doc, "items", query, arr, n, max, pass == 0, 0);    // despues el resto
     free(doc);
   }
   return n;
@@ -1679,6 +1782,8 @@ static void play_track_at(int i, double t) {
     status("Buscando el audio...  (O = cancelar)");
     if (yt_resolve(&tracks[i]) < 0) {
       snprintf(p_msg, sizeof p_msg, "%s", yt_err);
+      if (!yt_cancel && yt_ndiag) yt_diag_screen("No se pudo obtener el audio (esto dice por que):");
+      sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;
       p_start("", 0, 0, K_MP3, 0);
       plock(); p_end_gen = s_gen; s_err = 1; punlock();
       return;
@@ -1769,7 +1874,7 @@ static int player(int idx) {
     int next = -1;
     if (pr & SCE_CTRL_RTRIGGER) next = idx + 1;
     if (pr & SCE_CTRL_LTRIGGER) next = p_pos() > 5 ? idx : idx - 1;   // como en cualquier reproductor
-    if (!seek_pend && p_end_gen == s_gen) next = idx + 1;            // termino: la siguiente
+    if (!seek_pend && p_end_gen == s_gen && !p_msg[0]) next = idx + 1;   // termino: la siguiente (si hubo error, se queda)
     if (next >= 0 && next < ntracks) { idx = next; seek_pend = 0; play_track_at(idx, 0); }
     else if (next >= ntracks) { p_paused = 1; plock(); p_end_gen = s_gen; punlock(); }
 
@@ -2072,6 +2177,96 @@ static void yt_diag_screen(const char *title) {
   }
 }
 
+// Albumes: las listas "OLAK5uy_..." son los albumes de los canales "Artista - Topic"
+static int yt_album_search(const char *query, EntryList *l) {
+  char q2[160], qe[400], path[600];
+  yt_ndiag = 0;
+  for (int pass = 0; pass < 2 && l->n == 0; pass++) {
+    snprintf(q2, sizeof q2, pass == 0 ? "%s" : "%s album", query);
+    url_enc(q2, qe, sizeof qe, 0);
+    snprintf(path, sizeof path, "/search?q=%s&filter=%s", qe, pass == 0 ? "music_albums" : "playlists");
+    char *doc = yt_api(path, "\"items\"", 30, 14);
+    if (!doc) break;
+    for (const char *it = jarr_first(jget(doc, "items")); it; it = jarr_next(it)) {
+      char url[160] = "", name[160] = "", up[120] = "", th[300] = "";
+      const char *v;
+      if ((v = jget(it, "url"))) jtext(v, url, sizeof url);
+      if ((v = jget(it, "name")) || (v = jget(it, "title"))) jtext(v, name, sizeof name);
+      if ((v = jget(it, "uploaderName"))) jtext(v, up, sizeof up);
+      if ((v = jget(it, "thumbnail"))) jtext(v, th, sizeof th);
+      char *id = strstr(url, "list=");
+      if (!id) continue;
+      id += 5;
+      char *amp = strchr(id, '&'); if (amp) *amp = 0;
+      if (strncmp(id, "OLAK5uy_", 8) || !name[0]) continue;      // solo albumes de canales Topic
+      int dup = 0;
+      for (int k = 0; k < l->n; k++) if (!strcmp(l->e[k].id, id)) { dup = 1; break; }
+      if (dup) continue;
+      int ul = (int)strlen(up);
+      if (ul > 8 && !strcmp(up + ul - 8, " - Topic")) up[ul - 8] = 0;
+      Entry *e = el_add(l);
+      if (!e) break;
+      snprintf(e->id, sizeof e->id, "%s", id);
+      if (up[0]) snprintf(e->name, sizeof e->name, "%s - %s", up, name); else snprintf(e->name, sizeof e->name, "%s", name);
+      if (strlen(th) < sizeof e->img) snprintf(e->img, sizeof e->img, "%s", th);
+    }
+    free(doc);
+  }
+  return l->n;
+}
+
+// Devuelve 0 o LS_EXIT
+static int yt_album_view(void) {
+  static char query[128];
+  static ListState ls;
+  for (;;) {
+    if (!ime_search_t("Artista o album (YouTube Topic)", query, sizeof query)) return 0;
+    trim(query);
+    if (!query[0]) continue;
+    status("Buscando albumes en YouTube Topic...  (O = cancelar)");
+    EntryList l; memset(&l, 0, sizeof l);
+    int n = yt_album_search(query, &l);
+    sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;
+    if (!n) {
+      el_free(&l);
+      if (!yt_cancel) {
+        if (yt_err[0] && yt_ndiag) yt_diag_screen("Ninguna instancia respondio (esto dice por que):");
+        else msg_wait(yt_err[0] ? yt_err : "Sin albumes en canales Topic");
+      }
+      continue;
+    }
+    el_names(&l);
+    memset(&ls, 0, sizeof ls);
+    char title[160];
+    snprintf(title, sizeof title, "Albumes Topic: %s", query);
+    for (;;) {
+      int r = list_screen_img(title, l.names, l.keys, l.imgs, 0, l.n, &ls, "X: abrir album   O: volver", 0);
+      if (r == LS_EXIT) { el_free(&l); return LS_EXIT; }
+      if (r < 0) break;
+      status("Cargando canciones del album...  (O = cancelar)");
+      char path[160]; snprintf(path, sizeof path, "/playlists/%s", l.e[r].id);
+      yt_ndiag = 0;
+      char *doc = yt_api(path, "relatedStreams", 30, 10);
+      sceCtrlPeekBufferPositive(0, &pad, 1); oldpad = pad;
+      Track *arr = calloc(128, sizeof(Track));
+      int nt = (doc && arr) ? yt_collect(doc, "relatedStreams", "", arr, 0, 120, 0, 0) : 0;
+      free(doc);
+      if (!nt) {
+        free(arr);
+        if (!yt_cancel) {
+          if (yt_ndiag) yt_diag_screen("No se pudo abrir el album (esto dice por que):");
+          else msg_wait("Este album no tiene canciones disponibles");
+        }
+        continue;
+      }
+      set_playlist(arr, NULL, nt, l.e[r].name);
+      free(arr);
+      if (track_list(l.e[r].name) == LS_EXIT) { el_free(&l); return LS_EXIT; }
+    }
+    el_free(&l);
+  }
+}
+
 // Devuelve 0 o LS_EXIT
 static int yt_view(void) {
   static char query[128];
@@ -2131,10 +2326,10 @@ int main(void) {
   char m0[64], m1[64];
   snprintf(m0, sizeof m0, "Albumes (%d)", nalbums);
   snprintf(m1, sizeof m1, "Canciones (%d)", nsongs);
-  const char *menu[] = { m0, m1, "Artistas", "Buscar en YouTube (Topic)" };
+  const char *menu[] = { m0, m1, "Artistas", "YouTube: buscar canciones (Topic)", "YouTube: buscar albumes (Topic)" };
   ListState ls; memset(&ls, 0, sizeof ls);
   for (;;) {
-    int r = list_screen("Mi musica", menu, 4, &ls,
+    int r = list_screen("Mi musica", menu, 5, &ls,
                         nalbums + nsongs ? "X: entrar" : "Pega tus links en src/biblioteca.h y vuelve a compilar");
     if (r == LS_EXIT) break;
     int x = 0;
@@ -2142,6 +2337,7 @@ int main(void) {
     else if (r == 1) x = songs_view(NULL, nsongs, "Canciones");
     else if (r == 2) x = artists_view();
     else if (r == 3) x = yt_view();
+    else if (r == 4) x = yt_album_view();
     if (x == LS_EXIT) break;
   }
 
