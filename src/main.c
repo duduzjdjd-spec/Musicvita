@@ -1,10 +1,10 @@
-// MusicVita - musica de Internet Archive para PS Vita (homebrew, no oficial)
+// MusicVita - tu musica en la PS Vita (homebrew, no oficial)
 //
-//  - Artistas: Live Music Archive (coleccion "etree"): conciertos que las bandas permiten compartir.
-//  - Generos:  coleccion "netlabels": musica de sellos independientes con licencia Creative Commons.
-//  - Buscar:   en las dos colecciones, por artista o por album.
-//  - Portadas: archive.org/services/img/<identificador>
-//  - Reproductor: MP3 por streaming (HTTP Range), decodificado con minimp3 (CC0, github.com/lieff/minimp3).
+// La app solo muestra lo que pongas en src/biblioteca.h:
+//  - ALBUMES: links de Internet Archive (archive.org/details/...). Titulo, artista, portada y pistas salen solos.
+//  - CANCIONES: links directos a MP3 (opcional "Titulo | Artista | link").
+// Menu: Albumes, Canciones y Artistas (agrupa todo por artista).
+// Reproductor: MP3 por streaming (HTTP Range), decodificado con minimp3 (CC0, github.com/lieff/minimp3).
 //
 // Controles del reproductor: X/CUADRADO pausa, izquierda/derecha 10 s, arriba/abajo 1 min,
 // L/R pista anterior/siguiente, O volver.
@@ -30,6 +30,8 @@
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 
+#include "biblioteca.h"     // <- aqui van tus links
+
 // ---- Internet Archive (si cambia algo, editalo aqui) ----
 #define IA_SEARCH "https://archive.org/advancedsearch.php?q=%s&fl%%5B%%5D=identifier&fl%%5B%%5D=title" \
                   "&fl%%5B%%5D=creator&rows=%d&page=1&sort%%5B%%5D=%s&output=json"
@@ -37,10 +39,6 @@
 #define IA_IMG    "https://archive.org/services/img/%s"
 #define IA_DL     "https://archive.org/download/%s/%s"
 
-#define Q_ARTISTS "collection:etree AND mediatype:collection"
-#define Q_ARTIST  "collection:%s"
-#define Q_GENRE   "collection:netlabels AND mediatype:audio AND subject:\"%s\""
-#define Q_SEARCH  "(collection:etree OR collection:netlabels) AND (mediatype:audio OR mediatype:etree) AND (title:(%s) OR creator:(%s))"
 
 int _newlib_heap_size_user = 48 * 1024 * 1024;
 
@@ -580,41 +578,11 @@ static void url_enc(const char *s, char *o, int cap, int keep_slash) {
   o[i] = 0;
 }
 
-// Busqueda avanzada -> lista (identificador, titulo, artista, portada)
-static int ia_search(const char *q, const char *sort, int rows, int with_creator, EntryList *out) {
-  static char qe[2048], url[2600];
-  char se[64];
-  url_enc(q, qe, sizeof qe, 0);
-  url_enc(sort, se, sizeof se, 0);
-  snprintf(url, sizeof url, IA_SEARCH, qe, rows, se);
-  char *doc = http_get(url, NULL);
-  if (!doc) return -1;
-  const char *docs = jfind(doc, "docs", '[', 0);
-  for (const char *d = jarr_first(docs); d; d = jarr_next(d)) {
-    if (*jws(d) != '{') continue;
-    char id[96], title[160], creator[96];
-    const char *v;
-    id[0] = title[0] = creator[0] = 0;
-    if ((v = jget(d, "identifier"))) jtext(v, id, sizeof id);
-    if ((v = jget(d, "title"))) jtext(v, title, sizeof title);
-    if ((v = jget(d, "creator"))) jtext(v, creator, sizeof creator);
-    if (!id[0]) continue;
-    if (!title[0]) snprintf(title, sizeof title, "%s", id);
-    Entry *e = el_add(out); if (!e) break;
-    snprintf(e->id, sizeof e->id, "%s", id);
-    if (with_creator && creator[0] && !strstr(title, creator)) snprintf(e->name, sizeof e->name, "%s - %s", creator, title);
-    else snprintf(e->name, sizeof e->name, "%s", title);
-    snprintf(e->img, sizeof e->img, IA_IMG, id);
-  }
-  free(doc);
-  el_names(out);
-  return out->n ? 0 : -1;
-}
 
 // ---- Pistas de un album ----
-typedef struct { char file[256]; char title[128]; float len; long long size; int track; } Track;
+typedef struct { char file[256]; char title[128]; char artist[96]; char url[700]; char cover[160]; float len; long long size; int track; } Track;
 static Track *tracks; static int ntracks;
-static char alb_id[96], alb_title[160], alb_creator[96];
+static char alb_id[96], alb_title[160], alb_creator[96];   // lista que suena ahora (album o "Mis canciones")
 
 static float parse_len(const char *s) {          // "303.15" o "5:03" o "1:02:03"
   if (!s[0]) return 0;
@@ -683,6 +651,14 @@ static int load_tracks(const char *id) {
   }
   free(doc);
   if (ntracks > 1) qsort(tracks, ntracks, sizeof(Track), track_cmp);
+  char ide[200], fe[600];
+  url_enc(id, ide, sizeof ide, 0);
+  for (int i = 0; i < ntracks; i++) {
+    url_enc(tracks[i].file, fe, sizeof fe, 1);
+    snprintf(tracks[i].url, sizeof tracks[i].url, IA_DL, ide, fe);
+    snprintf(tracks[i].artist, sizeof tracks[i].artist, "%s", alb_creator);
+    snprintf(tracks[i].cover, sizeof tracks[i].cover, IA_IMG, id);
+  }
   return ntracks ? 0 : -1;
 }
 
@@ -701,6 +677,7 @@ static void punlock(void) { sceKernelUnlockMutex(p_mtx, 1); }
 
 static volatile int app_run = 1;
 static volatile int s_gen, s_eof_gen = -1, s_err;
+static volatile long long s_total;          // tamano del archivo (lo dice el servidor)
 static char s_url[1200];
 static long long s_off;
 static volatile int p_active, p_paused, p_end_gen = -1;
@@ -719,6 +696,8 @@ static size_t s_write(void *ptr, size_t sz, size_t nm, void *u) {
     x->checked = 1;
     if (code >= 400) return 0;
     if (code == 200) x->pos = 0;
+    curl_off_t cl = -1; curl_easy_getinfo(x->c, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
+    if (cl > 0 && x->gen == s_gen) s_total = (code == 206 ? x->want : 0) + (long long)cl;
   }
   while (done < t && x->pos < x->want) {
     long long k = x->want - x->pos; if (k > (long long)(t - done)) k = t - done;
@@ -872,7 +851,7 @@ static void p_start(const char *url, long long off, double base) {
   s_gen++;
   r_rd = r_wr = r_cnt = 0;
   snprintf(s_url, sizeof s_url, "%s", url);
-  s_off = off; s_err = 0;
+  s_off = off; s_err = 0; s_total = 0;
   p_base = base; p_samples = 0; p_paused = 0;
   punlock();
 }
@@ -888,25 +867,20 @@ static void fmt_time(double t, char *o, int cap) {
   if (h) snprintf(o, cap, "%d:%02d:%02d", h, m, s); else snprintf(o, cap, "%d:%02d", m, s);
 }
 
+static long long track_size(const Track *t) { return t->size > 0 ? t->size : s_total; }
 static double track_len(const Track *t) {
   if (t->len > 0) return t->len;
-  if (t->size > 0 && p_kbps > 0) return (double)t->size * 8 / (p_kbps * 1000.0);
+  long long sz = track_size(t);
+  if (sz > 0 && p_kbps > 0) return (double)sz * 8 / (p_kbps * 1000.0);
   return 0;
 }
 
-static void track_url(const Track *t, char *o, int cap) {
-  char ide[200], fe[600];
-  url_enc(alb_id, ide, sizeof ide, 0);
-  url_enc(t->file, fe, sizeof fe, 1);
-  snprintf(o, cap, IA_DL, ide, fe);
-}
 
 static void play_track_at(int i, double t) {
-  char url[1200];
-  track_url(&tracks[i], url, sizeof url);
+  const char *url = tracks[i].url;
   double len = track_len(&tracks[i]);
-  long long off = 0;
-  if (t > 0 && len > 0 && tracks[i].size > 0) off = (long long)(tracks[i].size * (t / len));
+  long long sz = track_size(&tracks[i]), off = 0;
+  if (t > 0 && len > 0 && sz > 0) off = (long long)(sz * (t / len));
   else if (t > 0 && p_kbps > 0) off = (long long)(t * p_kbps * 125);
   if (off <= 0) t = 0;
   p_start(url, off, t);
@@ -914,7 +888,6 @@ static void play_track_at(int i, double t) {
 
 // Pantalla del reproductor. Devuelve LS_BACK o LS_EXIT.
 static int player(int idx) {
-  char cover[160]; snprintf(cover, sizeof cover, IA_IMG, alb_id);
   p_active = 1;
   play_track_at(idx, 0);
   int seek_pend = 0, ret = LS_BACK;
@@ -953,10 +926,10 @@ static int player(int idx) {
     vita2d_start_drawing(); vita2d_clear_screen();
     vita2d_draw_rectangle(0, 0, 960, 544, RGBA8(14,14,28,255));
     vita2d_draw_rectangle(30, 40, 340, 340, RGBA8(30,30,50,255));
-    vita2d_texture *t = img_get(cover);
+    vita2d_texture *t = tracks[idx].cover[0] ? img_get(tracks[idx].cover) : NULL;
     if (t) draw_fit(t, 30, 40, 340, 340);
-    else vita2d_pgf_draw_text(pgf, 120, 215, RGBA8(120,120,150,255), 1.0f, "Cargando portada...");
-    vita2d_pgf_draw_text(pgf, 400, 70, RGBA8(170,170,200,255), 1.0f, fit_text(alb_creator, 1.0f, 530, cut, sizeof cut));
+    else vita2d_pgf_draw_text(pgf, 120, 215, RGBA8(120,120,150,255), 1.0f, tracks[idx].cover[0] ? "Cargando portada..." : "Sin portada");
+    vita2d_pgf_draw_text(pgf, 400, 70, RGBA8(170,170,200,255), 1.0f, fit_text(tracks[idx].artist, 1.0f, 530, cut, sizeof cut));
     vita2d_pgf_draw_text(pgf, 400, 100, RGBA8(200,200,230,255), 1.0f, fit_text(alb_title, 1.0f, 530, cut, sizeof cut));
     snprintf(l, sizeof l, "Pista %d de %d", idx + 1, ntracks);
     vita2d_pgf_draw_text(pgf, 400, 150, RGBA8(150,150,180,255), 0.9f, l);
@@ -990,28 +963,148 @@ static int player(int idx) {
 }
 
 // =====================================================================
-//                              NAVEGACION
+//                     TU BIBLIOTECA (src/biblioteca.h)
 // =====================================================================
-// Album -> pistas -> reproductor. Devuelve 0 o LS_EXIT.
-static int open_album(const char *id) {
-  status("Cargando pistas...");
-  if (load_tracks(id) < 0) { show_error("Este album no tiene MP3 para escuchar"); return 0; }
+typedef struct { char id[96]; char title[160]; char artist[96]; } Album;
+static Album *albums; static int nalbums;
+static Track *songs; static int nsongs;
+
+static void trim(char *s) {
+  int n = strlen(s);
+  while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n')) s[--n] = 0;
+  int i = 0; while (s[i] == ' ' || s[i] == '\t') i++;
+  if (i) memmove(s, s + i, n - i + 1);
+}
+
+// "https://archive.org/details/ID/..." o ".../download/ID/..." -> ID (y lo que sigue en "rest")
+static int ia_parts(const char *link, char *id, int icap, char *rest, int rcap) {
+  const char *p = strstr(link, "archive.org/details/");
+  if (p) p += 20; else if ((p = strstr(link, "archive.org/download/"))) p += 21; else return 0;
+  int i = 0;
+  while (*p && *p != '/' && *p != '?' && *p != '#' && i < icap - 1) id[i++] = *p++;
+  id[i] = 0;
+  if (rest) {
+    int j = 0;
+    if (*p == '/') { p++; while (*p && *p != '?' && *p != '#' && j < rcap - 1) rest[j++] = *p++; }
+    rest[j] = 0;
+  }
+  return id[0] != 0;
+}
+
+static void url_dec(const char *s, char *o, int cap) {
+  int i = 0;
+  while (*s && i < cap - 1) {
+    if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
+      char h[3] = { s[1], s[2], 0 }; o[i++] = (char)strtol(h, NULL, 16); s += 3;
+    } else o[i++] = *s++;
+  }
+  o[i] = 0;
+}
+
+static void load_library(void) {
+  // albumes: un solo pedido a Internet Archive para todos los titulos y artistas
+  int na = 0;
+  for (int i = 0; i < (int)(sizeof ALBUMES / sizeof ALBUMES[0]); i++) if (ALBUMES[i] && ALBUMES[i][0]) na++;
+  albums = calloc(na ? na : 1, sizeof(Album));
+  static char q[8192];
+  int ql = snprintf(q, sizeof q, "identifier:(");
+  for (int i = 0; i < (int)(sizeof ALBUMES / sizeof ALBUMES[0]) && albums; i++) {
+    if (!ALBUMES[i] || !ALBUMES[i][0]) continue;
+    char id[96];
+    if (!ia_parts(ALBUMES[i], id, sizeof id, NULL, 0)) {     // tambien acepta el identificador solo
+      snprintf(id, sizeof id, "%s", ALBUMES[i]); trim(id);
+      if (strchr(id, '/') || strchr(id, ' ')) continue;
+    }
+    Album *al = &albums[nalbums++];
+    snprintf(al->id, sizeof al->id, "%s", id);
+    snprintf(al->title, sizeof al->title, "%s", id);
+    if (ql < (int)sizeof q - 200) ql += snprintf(q + ql, sizeof q - ql, "%s\"%s\"", nalbums > 1 ? " OR " : "", id);
+  }
+  snprintf(q + ql, sizeof q - ql, ")");
+  if (nalbums) {
+    status("Cargando tus albumes...");
+    static char qe[9000], url[9600];
+    url_enc(q, qe, sizeof qe, 0);
+    snprintf(url, sizeof url, IA_SEARCH, qe, nalbums + 10, "identifier%20asc");
+    char *doc = http_get(url, NULL);
+    const char *docs = doc ? jfind(doc, "docs", '[', 0) : NULL;
+    for (const char *d = jarr_first(docs); d; d = jarr_next(d)) {
+      char id[96] = "", title[160] = "", creator[96] = "";
+      const char *v;
+      if ((v = jget(d, "identifier"))) jtext(v, id, sizeof id);
+      if ((v = jget(d, "title"))) jtext(v, title, sizeof title);
+      if ((v = jget(d, "creator"))) jtext(v, creator, sizeof creator);
+      for (int i = 0; i < nalbums; i++) {
+        if (strcmp(albums[i].id, id)) continue;
+        if (title[0]) snprintf(albums[i].title, sizeof albums[i].title, "%s", title);
+        snprintf(albums[i].artist, sizeof albums[i].artist, "%s", creator);
+      }
+    }
+    free(doc);
+  }
+  // canciones: "Titulo | Artista | link" o solo el link
+  int ns = 0;
+  for (int i = 0; i < (int)(sizeof CANCIONES / sizeof CANCIONES[0]); i++) if (CANCIONES[i] && CANCIONES[i][0]) ns++;
+  songs = calloc(ns ? ns : 1, sizeof(Track));
+  for (int i = 0; i < (int)(sizeof CANCIONES / sizeof CANCIONES[0]) && songs; i++) {
+    if (!CANCIONES[i] || !CANCIONES[i][0]) continue;
+    char buf[1000], *f[3] = { NULL, NULL, NULL };
+    snprintf(buf, sizeof buf, "%s", CANCIONES[i]);
+    int nf = 0; char *p = buf;
+    f[nf++] = p;
+    while (nf < 3 && (p = strchr(p, '|'))) { *p++ = 0; f[nf++] = p; }
+    for (int k = 0; k < nf; k++) trim(f[k]);
+    char *link = f[nf - 1];
+    if (!link[0]) continue;
+    Track *t = &songs[nsongs];
+    memset(t, 0, sizeof *t);
+    char id[96], rest[600];
+    if (ia_parts(link, id, sizeof id, rest, sizeof rest) && rest[0]) {   // de Internet Archive
+      char ide[200]; url_enc(id, ide, sizeof ide, 0);
+      char rd[600]; url_dec(rest, rd, sizeof rd);
+      char fe[700]; url_enc(rd, fe, sizeof fe, 1);
+      snprintf(t->url, sizeof t->url, IA_DL, ide, fe);
+      snprintf(t->cover, sizeof t->cover, IA_IMG, id);
+    } else snprintf(t->url, sizeof t->url, "%s", link);
+    if (nf >= 2 && f[0][0]) snprintf(t->title, sizeof t->title, "%s", f[0]);
+    if (nf >= 3 && f[1][0]) snprintf(t->artist, sizeof t->artist, "%s", f[1]);
+    if (!t->title[0]) {                                    // el nombre del archivo
+      char nm[300]; const char *b = strrchr(link, '/'); b = b ? b + 1 : link;
+      snprintf(nm, sizeof nm, "%s", b);
+      char *qm = strchr(nm, '?'); if (qm) *qm = 0;
+      url_dec(nm, t->title, sizeof t->title);
+      char *dot = strrchr(t->title, '.'); if (dot) *dot = 0;
+    }
+    nsongs++;
+  }
+}
+
+// Pone una lista de canciones como "lo que suena"
+static void set_playlist(const Track *src, const int *idx, int n, const char *title) {
+  free(tracks); tracks = calloc(n ? n : 1, sizeof(Track)); ntracks = 0;
+  for (int i = 0; i < n && tracks; i++) tracks[ntracks++] = src[idx ? idx[i] : i];
+  snprintf(alb_title, sizeof alb_title, "%s", title);
+  alb_creator[0] = 0;
+}
+
+// Lista de canciones (album o sueltas) -> reproductor. Devuelve 0 o LS_EXIT.
+static int track_list(const char *title) {
   EntryList l; memset(&l, 0, sizeof l);
-  char cover[160]; snprintf(cover, sizeof cover, IA_IMG, id);
   for (int i = 0; i < ntracks; i++) {
     Entry *e = el_add(&l); if (!e) break;
     char tl[16]; double len = tracks[i].len;
     if (len > 0) fmt_time(len, tl, sizeof tl); else tl[0] = 0;
-    snprintf(e->name, sizeof e->name, "%d. %s%s%s%s", i + 1, tracks[i].title, tl[0] ? "  (" : "", tl, tl[0] ? ")" : "");
-    snprintf(e->key, sizeof e->key, "%s", tracks[i].title);
-    snprintf(e->img, sizeof e->img, "%s", cover);
+    if (tracks[i].artist[0] && strcmp(tracks[i].artist, alb_creator))
+      snprintf(e->name, sizeof e->name, "%d. %s - %s%s%s%s", i + 1, tracks[i].title, tracks[i].artist, tl[0] ? "  (" : "", tl, tl[0] ? ")" : "");
+    else snprintf(e->name, sizeof e->name, "%d. %s%s%s%s", i + 1, tracks[i].title, tl[0] ? "  (" : "", tl, tl[0] ? ")" : "");
+    snprintf(e->key, sizeof e->key, "%s %s", tracks[i].title, tracks[i].artist);
+    snprintf(e->img, sizeof e->img, "%s", tracks[i].cover);
   }
   el_names(&l);
   ListState ls; memset(&ls, 0, sizeof ls);
-  char title[200]; snprintf(title, sizeof title, "%s", alb_title[0] ? alb_title : id);
   int ret = 0;
   for (;;) {
-    int r = list_screen_img(title, l.names, l.keys, l.imgs, 0, l.n, &ls, "X: escuchar desde esta pista   O: volver", 0);
+    int r = list_screen_img(title, l.names, l.keys, l.imgs, 0, l.n, &ls, "X: escuchar desde esta cancion   O: volver", 0);
     if (r == LS_EXIT) { ret = LS_EXIT; break; }
     if (r < 0) break;
     if (player(r) == LS_EXIT) { ret = LS_EXIT; break; }
@@ -1020,89 +1113,82 @@ static int open_album(const char *id) {
   return ret;
 }
 
-// Lista de albumes. Devuelve 0 o LS_EXIT.
-static int album_list(const char *title, EntryList *albums) {
+static int open_album(const Album *al) {
+  status("Cargando canciones...");
+  if (load_tracks(al->id) < 0) { show_error("Este album no tiene MP3 para escuchar"); return 0; }
+  if (!alb_creator[0] && al->artist[0]) snprintf(alb_creator, sizeof alb_creator, "%s", al->artist);
+  for (int i = 0; i < ntracks; i++) if (!tracks[i].artist[0]) snprintf(tracks[i].artist, sizeof tracks[i].artist, "%s", alb_creator);
+  return track_list(alb_title[0] ? alb_title : al->title);
+}
+
+// Lista de albumes (todos o de un artista). Devuelve 0 o LS_EXIT.
+static int album_list(const char *title, const int *idx, int n) {
+  EntryList l; memset(&l, 0, sizeof l);
+  for (int i = 0; i < n; i++) {
+    const Album *al = &albums[idx ? idx[i] : i];
+    Entry *e = el_add(&l); if (!e) break;
+    snprintf(e->id, sizeof e->id, "%d", idx ? idx[i] : i);
+    if (al->artist[0]) snprintf(e->name, sizeof e->name, "%s - %s", al->artist, al->title);
+    else snprintf(e->name, sizeof e->name, "%s", al->title);
+    snprintf(e->img, sizeof e->img, IA_IMG, al->id);
+  }
+  el_names(&l);
   ListState ls; memset(&ls, 0, sizeof ls);
+  int ret = 0;
   for (;;) {
-    int r = list_screen_img(title, albums->names, albums->keys, albums->imgs, 0, albums->n, &ls,
-                            "X: abrir album   O: volver", 0);
-    if (r == LS_EXIT) return LS_EXIT;
-    if (r < 0) return 0;
-    char id[96]; snprintf(id, sizeof id, "%s", albums->e[r].id);
-    if (open_album(id) == LS_EXIT) return LS_EXIT;
+    int r = list_screen_img(title, l.names, l.keys, l.imgs, 0, l.n, &ls, "X: abrir album   O: volver", 0);
+    if (r == LS_EXIT) { ret = LS_EXIT; break; }
+    if (r < 0) break;
+    if (open_album(&albums[atoi(l.e[r].id)]) == LS_EXIT) { ret = LS_EXIT; break; }
   }
+  el_free(&l);
+  return ret;
 }
 
-static int browse_artists(void) {
-  static EntryList artists;
-  static ListState ls;
-  if (!artists.n) {
-    status("Descargando artistas (puede tardar un poco)...");
-    if (ia_search(Q_ARTISTS, "titleSorter asc", 10000, 0, &artists) < 0) { el_free(&artists); show_error("No se pudo bajar la lista de artistas"); return 0; }
+static int songs_view(const int *idx, int n, const char *title) {
+  set_playlist(songs, idx, n, title);
+  return track_list(title);
+}
+
+// Artistas: junta los de tus albumes y tus canciones
+static int artists_view(void) {
+  static char names[256][96];
+  int na = 0;
+  for (int i = 0; i < nalbums + nsongs && na < 256; i++) {
+    const char *a = i < nalbums ? albums[i].artist : songs[i - nalbums].artist;
+    if (!a[0]) a = "(sin artista)";
+    int found = 0;
+    for (int k = 0; k < na; k++) if (!strcasecmp(names[k], a)) { found = 1; break; }
+    if (!found) snprintf(names[na++], sizeof names[0], "%s", a);
   }
+  const char *ptr[256];
+  for (int k = 0; k < na; k++) ptr[k] = names[k];
+  static ListState ls;
   for (;;) {
-    int r = list_screen_img("Artistas (conciertos en vivo)", artists.names, artists.keys, artists.imgs, 0, artists.n, &ls,
-                            "X: ver conciertos   O: menu", 0);
+    int r = list_screen("Artistas", ptr, na, &ls, "X: ver su musica   O: menu");
     if (r == LS_EXIT) return LS_EXIT;
     if (r < 0) return 0;
-    char q[200]; snprintf(q, sizeof q, Q_ARTIST, artists.e[r].id);
-    EntryList albums; memset(&albums, 0, sizeof albums);
-    status("Descargando conciertos...");
-    if (ia_search(q, "date desc", 1000, 0, &albums) < 0) { el_free(&albums); show_error("Sin conciertos"); continue; }
-    char title[220]; snprintf(title, sizeof title, "%s", artists.e[r].name);
-    int x = album_list(title, &albums);
-    el_free(&albums);
+    const char *who = names[r];
+    int noart = !strcmp(who, "(sin artista)");
+    int ai[256], si[256], nai = 0, nsi = 0;
+    for (int i = 0; i < nalbums && nai < 256; i++) if (noart ? !albums[i].artist[0] : !strcasecmp(albums[i].artist, who)) ai[nai++] = i;
+    for (int i = 0; i < nsongs && nsi < 256; i++) if (noart ? !songs[i].artist[0] : !strcasecmp(songs[i].artist, who)) si[nsi++] = i;
+    // si tiene albumes y canciones, pregunta cual ver
+    int x = 0;
+    if (nai && nsi) {
+      const char *opt[2] = { "Albumes", "Canciones" };
+      ListState ls2; memset(&ls2, 0, sizeof ls2);
+      for (;;) {
+        int c = list_screen(who, opt, 2, &ls2, "X: entrar   O: volver");
+        if (c == LS_EXIT) return LS_EXIT;
+        if (c < 0) break;
+        x = c == 0 ? album_list(who, ai, nai) : songs_view(si, nsi, who);
+        if (x == LS_EXIT) return LS_EXIT;
+      }
+    } else if (nai) x = album_list(who, ai, nai);
+    else x = songs_view(si, nsi, who);
     if (x == LS_EXIT) return LS_EXIT;
   }
-}
-
-static const char *GENRES[][2] = {
-  { "Rock", "rock" }, { "Electronica", "electronic" }, { "Ambient", "ambient" }, { "Hip Hop", "hip hop" },
-  { "Jazz", "jazz" }, { "Pop", "pop" }, { "Folk", "folk" }, { "Metal", "metal" }, { "Punk", "punk" },
-  { "Reggae", "reggae" }, { "Dub", "dub" }, { "Blues", "blues" }, { "Clasica", "classical" },
-  { "Techno", "techno" }, { "House", "house" }, { "Drum and bass", "drum and bass" },
-  { "Downtempo", "downtempo" }, { "Lo-fi", "lo-fi" }, { "Chiptune", "chiptune" },
-  { "Experimental", "experimental" }, { "Indie", "indie" }, { "Latina", "latin" }, { "Soundtrack", "soundtrack" },
-};
-#define NGENRES ((int)(sizeof GENRES / sizeof GENRES[0]))
-
-static int browse_genres(void) {
-  static ListState ls;
-  const char *names[NGENRES];
-  for (int i = 0; i < NGENRES; i++) names[i] = GENRES[i][0];
-  for (;;) {
-    int r = list_screen("Generos (musica libre de netlabels)", names, NGENRES, &ls, "X: ver albumes   O: menu");
-    if (r == LS_EXIT) return LS_EXIT;
-    if (r < 0) return 0;
-    char q[200]; snprintf(q, sizeof q, Q_GENRE, GENRES[r][1]);
-    EntryList albums; memset(&albums, 0, sizeof albums);
-    status("Descargando albumes...");
-    if (ia_search(q, "downloads desc", 500, 1, &albums) < 0) { el_free(&albums); show_error("Sin albumes en este genero"); continue; }
-    char title[120]; snprintf(title, sizeof title, "Genero: %s", GENRES[r][0]);
-    int x = album_list(title, &albums);
-    el_free(&albums);
-    if (x == LS_EXIT) return LS_EXIT;
-  }
-}
-
-// Busqueda libre: deja solo letras, numeros y espacios (lo demas tiene significado en la consulta)
-static int browse_search(void) {
-  static char query[128];
-  if (!ime_search_t("Buscar artista o album", query, sizeof query) || !query[0]) return 0;
-  char clean[128]; int j = 0;
-  for (int i = 0; query[i] && j < (int)sizeof clean - 1; i++) {
-    unsigned char c = (unsigned char)query[i];
-    clean[j++] = (isalnum(c) || c >= 0x80) ? c : ' ';
-  }
-  clean[j] = 0;
-  char q[600]; snprintf(q, sizeof q, Q_SEARCH, clean, clean);
-  EntryList res; memset(&res, 0, sizeof res);
-  status("Buscando...");
-  if (ia_search(q, "downloads desc", 300, 1, &res) < 0) { el_free(&res); show_error("Sin resultados"); return 0; }
-  char title[200]; snprintf(title, sizeof title, "Resultados: %s", query);
-  int x = album_list(title, &res);
-  el_free(&res);
-  return x;
 }
 
 // ---------- Main ----------
@@ -1131,15 +1217,20 @@ int main(void) {
   sceKernelStartThread(th_net, 0, NULL);
   sceKernelStartThread(th_dec, 0, NULL);
 
-  static const char *menu[] = { "Artistas (conciertos en vivo)", "Generos (musica libre)", "Buscar artista o album" };
+  load_library();
+  char m0[64], m1[64];
+  snprintf(m0, sizeof m0, "Albumes (%d)", nalbums);
+  snprintf(m1, sizeof m1, "Canciones (%d)", nsongs);
+  const char *menu[] = { m0, m1, "Artistas" };
   ListState ls; memset(&ls, 0, sizeof ls);
   for (;;) {
-    int r = list_screen("Musica de Internet Archive", menu, 3, &ls, "X: entrar");
+    int r = list_screen("Mi musica", menu, 3, &ls,
+                        nalbums + nsongs ? "X: entrar" : "Pega tus links en src/biblioteca.h y vuelve a compilar");
     if (r == LS_EXIT) break;
     int x = 0;
-    if (r == 0) x = browse_artists();
-    else if (r == 1) x = browse_genres();
-    else if (r == 2) x = browse_search();
+    if (r == 0) x = album_list("Albumes", NULL, nalbums);
+    else if (r == 1) x = songs_view(NULL, nsongs, "Canciones");
+    else if (r == 2) x = artists_view();
     if (x == LS_EXIT) break;
   }
 
