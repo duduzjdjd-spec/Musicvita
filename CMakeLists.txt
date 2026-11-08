@@ -25,7 +25,7 @@ target_link_libraries(${PROJECT_NAME}
   SceDisplay_stub SceGxm_stub SceCtrl_stub SceSysmodule_stub
   ScePgf_stub ScePvf_stub SceCommonDialog_stub
   SceNet_stub SceNetCtl_stub
-  SceAudio_stub SceAppUtil_stub
+  SceAudio_stub SceAudiodec_stub SceAppUtil_stub
   SceAppMgr_stub SceLibKernel_stub
 )
 
