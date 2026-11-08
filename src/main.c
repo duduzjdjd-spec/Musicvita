@@ -1428,10 +1428,32 @@ static void yt_add_inst(const char *u) {
   if (yt_ninst < YT_MAXINST) snprintf(yt_inst[yt_ninst++], sizeof yt_inst[0], "%s", b);
 }
 
+// Instancias incluidas (lista oficial de Piped). En biblioteca.h puedes agregar mas con PIPED_EXTRA (opcional).
+static const char *const YT_BUILTIN[] = {
+  "https://pipedapi.kavin.rocks",
+  "https://pipedapi.leptons.xyz",
+  "https://pipedapi.nosebs.ru",
+  "https://pipedapi-libre.kavin.rocks",
+  "https://piped-api.privacy.com.de",
+  "https://pipedapi.adminforge.de",
+  "https://api.piped.yt",
+  "https://pipedapi.drgns.space",
+  "https://pipedapi.owo.si",
+  "https://pipedapi.ducks.party",
+  "https://piped-api.codespace.cz",
+  "https://pipedapi.reallyaweso.me",
+  "https://api.piped.private.coffee",
+  "https://pipedapi.darkness.services",
+  "https://pipedapi.orangenet.cc",
+#ifdef PIPED_EXTRA
+  PIPED_EXTRA
+#endif
+};
+
 static void yt_init_inst(void) {
-  FILE *f = fopen("ux0:data/MusicVita/piped.txt", "r");
+  FILE *f = fopen("ux0:data/MusicVita/piped.txt", "r");        // opcional: una URL por linea, sin recompilar
   if (f) { char b[160]; while (fgets(b, sizeof b, f)) yt_add_inst(b); fclose(f); }
-  for (int i = 0; i < (int)(sizeof PIPED / sizeof PIPED[0]); i++) if (PIPED[i] && PIPED[i][0]) yt_add_inst(PIPED[i]);
+  for (int i = 0; i < (int)(sizeof YT_BUILTIN / sizeof YT_BUILTIN[0]); i++) yt_add_inst(YT_BUILTIN[i]);
 }
 
 // O cancela la busqueda
